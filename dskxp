@@ -11,7 +11,7 @@
 set -o pipefail
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROG=dskxp
 
 LOG_FILE=${DSKXP_LOG:-/var/log/dskxp.log}
@@ -27,6 +27,8 @@ OPT_DRY_RUN=0
 OPT_YES=0
 OPT_FORCE=0
 OPT_INSTALL=0
+OPT_VERBOSE=0
+OPT_QUIET=0
 OPT_RESCAN=1
 OPT_UI=auto
 OPT_SIZE=all
@@ -80,7 +82,7 @@ part_disk()    { basename "$(dirname "$(readlink -f "/sys/class/block/$1")")"; }
 part_num()     { cat "/sys/class/block/$1/partition"; }
 dev_bytes()    { echo $(( $(cat "/sys/class/block/$1/size" 2>/dev/null || echo 0) * 512 )); }
 has_holders()  { local h; for h in /sys/class/block/"$1"/holders/*; do [[ -e $h ]] && return 0; done; return 1; }
-has_signature(){ blkid -p "/dev/$1" >/dev/null 2>&1; }
+has_signature(){ vshow "blkid -p /dev/$1"; blkid -p "/dev/$1" >/dev/null 2>&1; }
 is_mounted()   { findmnt -n --source "/dev/$1" >/dev/null 2>&1 || grep -q "^/dev/$1 " /proc/swaps 2>/dev/null; }
 
 part_path() {   # part_path DISK NUM
@@ -101,6 +103,78 @@ list_disks() {
 }
 
 # --------------------------------------------------------------------------
+# startup progress (stderr, so --list / --check output stays clean)
+# --------------------------------------------------------------------------
+
+PROGRESS=0 P_N=0 P_TOTAL=6 P_OPEN=0 P_T0=0 P_TS=0
+
+now_ms() {
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        local t=${EPOCHREALTIME/[.,]/}
+        echo $(( t / 1000 ))
+    else
+        echo $(( $(date +%s%N) / 1000000 ))
+    fi
+}
+
+secs() { awk -v ms="$1" 'BEGIN { printf "%.1fs", ms / 1000 }'; }
+
+p_break() { if (( P_OPEN )); then printf '\n' >&2; P_OPEN=0; fi; }
+
+step() {   # step LABEL
+    (( PROGRESS )) || return 0
+    P_N=$(( P_N + 1 )); P_TS=$(now_ms)
+    local head
+    head=$(printf '[%d/%d] %s ' "$P_N" "$P_TOTAL" "$1")
+    log "step $P_N/$P_TOTAL: $1"
+    if (( OPT_VERBOSE )); then
+        printf '%s\n' "$head" >&2
+    else
+        printf '%s' "$head" >&2; P_OPEN=1
+        P_HEADLEN=${#head}
+    fi
+}
+
+step_done() {   # step_done RESULT
+    (( PROGRESS )) || return 0
+    local took dots="" n
+    took=$(( $(now_ms) - P_TS ))
+    local res=$1
+    (( took >= 500 )) && res+=" ($(secs "$took"))"
+    log "  -> $res"
+    if (( P_OPEN )); then
+        n=$(( 44 - P_HEADLEN )); (( n < 3 )) && n=3
+        printf -v dots '%*s' "$n" ''; dots=${dots// /.}
+        printf '%s %s\n' "$dots" "$res" >&2
+        P_OPEN=0
+    else
+        printf '      => %s\n' "$res" >&2
+    fi
+}
+
+p_detail() {   # extra line under the current step
+    (( PROGRESS )) || return 0
+    p_break
+    printf '      %s\n' "$1" >&2
+    log "     $1"
+}
+
+vshow() { (( OPT_VERBOSE )) && p_detail "\$ $*"; return 0; }   # show a read-only command
+
+progress_start() {
+    (( OPT_QUIET )) && return 0
+    PROGRESS=1 P_N=0 P_T0=$(now_ms)
+    printf 'dskxp %s - starting%s\n' "$VERSION" "$( (( OPT_VERBOSE )) && printf ' (verbose: showing every command)')" >&2
+}
+
+progress_end() {
+    (( PROGRESS )) || return 0
+    p_break
+    printf 'Done in %s\n' "$(secs $(( $(now_ms) - P_T0 )))" >&2
+    PROGRESS=0
+}
+
+# --------------------------------------------------------------------------
 # rescan
 # --------------------------------------------------------------------------
 
@@ -112,20 +186,35 @@ rescan_disks() {
     local -A before=()
     for d in $(list_disks); do before[$d]=$(dev_bytes "$d"); done
 
+    local hosts="" disks="" nvme=""
     for f in /sys/class/scsi_host/host*/scan; do
-        [[ -w $f ]] && echo '- - -' >"$f" 2>/dev/null
+        [[ -w $f ]] || continue
+        vshow "echo '- - -' > $f"
+        echo '- - -' >"$f" 2>/dev/null
+        f=${f%/scan}; hosts+="${hosts:+ }${f##*/}"
     done
+    [[ -n $hosts ]] && p_detail "SCSI hosts scanned for new disks: $hosts"
     for d in $(list_disks); do
         if [[ -w /sys/block/$d/device/rescan ]]; then
+            vshow "echo 1 > /sys/block/$d/device/rescan"
             echo 1 >"/sys/block/$d/device/rescan" 2>/dev/null
+            disks+="${disks:+ }$d"
         elif [[ $d == loop* ]]; then
+            vshow "losetup -c /dev/$d"
             losetup -c "/dev/$d" 2>/dev/null
+            disks+="${disks:+ }$d"
         fi
     done
     for c in /sys/class/nvme/nvme*; do
-        [[ -w $c/rescan_controller ]] && echo 1 >"$c/rescan_controller" 2>/dev/null
+        [[ -w $c/rescan_controller ]] || continue
+        vshow "echo 1 > $c/rescan_controller"
+        echo 1 >"$c/rescan_controller" 2>/dev/null
+        nvme+="${nvme:+ }${c##*/}"
     done
-    command -v udevadm >/dev/null && udevadm settle 2>/dev/null
+    [[ -n $disks ]] && p_detail "disks asked for their current size: $disks"
+    [[ -n $nvme ]] && p_detail "NVMe controllers rescanned: $nvme"
+    [[ -z $disks$nvme ]] && p_detail "no disk supports a rescan (virtio disks update their size by themselves)"
+    have udevadm && { vshow "udevadm settle"; udevadm settle 2>/dev/null; }
 
     RESCAN_REPORT=""
     for d in $(list_disks); do
@@ -133,9 +222,11 @@ rescan_disks() {
         if [[ -z ${before[$d]:-} ]]; then
             RESCAN_INFO[$d]="new disk"
             RESCAN_REPORT+="  /dev/$d: new disk, $(human "$now")"$'\n'
+            p_detail "/dev/$d: NEW disk, $(human "$now")"
         elif (( now != before[$d] )); then
             RESCAN_INFO[$d]="was $(human "${before[$d]}")"
             RESCAN_REPORT+="  /dev/$d: $(human "${before[$d]}") -> $(human "$now")"$'\n'
+            p_detail "/dev/$d: GREW $(human "${before[$d]}") -> $(human "$now")"
         fi
     done
     log "rescan: ${RESCAN_REPORT:-no changes}"
@@ -157,6 +248,7 @@ load_disk() {
     DISK_FIRSTLBA[$d]=2048
     DISK_LASTLBA[$d]=0
     DISK_PARTS[$d]=""
+    vshow "sfdisk -d /dev/$d"
     dump=$(sfdisk -d "/dev/$d" 2>/dev/null) || dump=""
     while IFS= read -r line; do
         case $line in
@@ -217,7 +309,7 @@ needs_relocate() {   # GPT backup header not at the (new) end of the disk
 # --------------------------------------------------------------------------
 
 declare -A COVERED=()
-CH_STEPS="" CH_NOTE="" CH_DISKS="" CH_VERIFY="" NEWSIZE=0
+CH_STEPS="" CH_NOTE="" CH_DISKS="" CH_VERIFY="" CH_BLOCKER="" NEWSIZE=0
 US=$'\x1f'   # field separator for verification records
 
 ch_add() { CH_STEPS+="$1"$'\t'"$2"$'\n'; }
@@ -269,6 +361,7 @@ grow_partition() {
         done
         es=${PART_START[$d:$ext]}; ee=$(( es + ${PART_SIZE[$d:$ext]} ))
         inner=$(( ee - e )); lim=$(top_limit "$d" "$es"); outer=$(( lim - ee ))
+        blocker_after "$d" "$ext" "$lim"
         (( outer < 0 )) && outer=0
         free=$(( inner + outer ))
         gain=$(( free * ss / MiB * MiB ))
@@ -287,6 +380,7 @@ grow_partition() {
     else
         lim=$(top_limit "$d" "$s"); free=$(( lim - e ))
         (( free < 0 )) && free=0
+        blocker_after "$d" "$n" "$lim"
         gain=$(( free * ss / MiB * MiB ))
         if (( gain >= MiB )); then
             needs_relocate "$d" && ch_add "Move the backup GPT header of $dev to the end of the disk" "sfdisk --relocate gpt-bak-std $dev"
@@ -302,6 +396,20 @@ grow_partition() {
     NEWSIZE=$(( cur + gain ))
 }
 
+blocker_after() {   # blocker_after DISK PARTNUM LIMIT -> CH_BLOCKER: what sits right after it
+    local d=$1 n=$2 lim=$3 m nx="" what
+    for m in ${DISK_PARTS[$d]}; do
+        part_is_logical "$d" "$m" && continue
+        [[ ${PART_START[$d:$m]} == "$lim" ]] && nx=$m
+    done
+    if [[ -n $nx ]]; then
+        what=$(describe_dev "$(part_path "$d" "$nx")")
+        CH_BLOCKER="$(part_path "$d" "$n") is directly followed by $(part_path "$d" "$nx") ($what); growing it would mean moving that partition, which dskxp does not do"
+    else
+        CH_BLOCKER="there is no unallocated space after $(part_path "$d" "$n")"
+    fi
+}
+
 grow_crypt() {
     local k=$1 name cur parent pnew off new
     local -a slaves=(/sys/block/"$k"/slaves/*)
@@ -311,6 +419,7 @@ grow_crypt() {
     fi
     parent=${slaves[0]##*/}
     grow_layer "$parent"; pnew=$NEWSIZE
+    vshow "cryptsetup status $name"
     off=$(cryptsetup status "$name" 2>/dev/null | awk '$1 == "offset:" { print $2 }')
     [[ $off =~ ^[0-9]+$ ]] || off=$(( ($(dev_bytes "$parent") - cur) / 512 ))
     new=$(( pnew - off * 512 ))
@@ -369,15 +478,53 @@ discover() {
     declare -gA SRC_DISK=() SRC_START=() SRC_SECTORS=() COVERED=()
     declare -gA DISK_LOADED=() DISK_LABEL=() DISK_SS=() DISK_SECT=() DISK_FIRSTLBA=() DISK_LASTLBA=() DISK_PARTS=()
     declare -gA PART_START=() PART_SIZE=() PART_TYPE=()
+    local d n cnt=0 key fsn=0 id total=0
 
+    step "Reading partition tables"
+    for d in $(list_disks); do
+        load_disk "$d"; cnt=$(( cnt + 1 ))
+        n=$(wc -w <<<"${DISK_PARTS[$d]}")
+        p_detail "$(printf '/dev/%-10s %9s  %s' "$d" "$(human "$(dev_bytes "$d")")" \
+            "$( [[ ${DISK_LABEL[$d]} == none ]] && echo "no partition table" || echo "${DISK_LABEL[$d]}, $n partition(s)")")"
+    done
+    step_done "$cnt disk(s)"
+
+    step "Reading LVM"
     discover_lvm
+    step_done "${#VG_LIST[@]} VG, ${#PV_LIST[@]} PV, ${#LV_LIST[@]} LV"
+
+    step "Checking filesystems and mounts"
     discover_lv_usage
+    for key in "${LV_LIST[@]}"; do
+        [[ -n ${LV_FS[$key]} && ${LV_FS[$key]} != \(* ]] && fsn=$(( fsn + 1 ))
+        p_detail "$(printf '%-26s %9s  %s' "$key" "$(human "${LV_SIZE[$key]}")" \
+            "${LV_FS[$key]:-no filesystem}${LV_MNT[$key]:+ on ${LV_MNT[$key]}}${LV_USE[$key]:+ (${LV_USE[$key]} used)}")"
+    done
+    step_done "$fsn filesystem(s)"
+
+    step "Looking for free space"
     discover_grow_sources
     discover_free_sources
+    discover_plain
+    for id in "${SRC_LIST[@]}"; do
+        total=$(( total + ${SRC_GAIN[$id]} ))
+        p_detail "$(printf '%9s  %s' "~$(human "${SRC_GAIN[$id]}")" "${SRC_LABEL[$id]}")"
+    done
+    local pn=0
+    for id in "${PL_LIST[@]}"; do
+        (( ${PL_GAIN[$id]} > 0 )) || continue
+        pn=$(( pn + 1 ))
+        p_detail "$(printf '%9s  %s' "~$(human "${PL_GAIN[$id]}")" "grow ${PL_MNT[$id]%% *} (${PL_DEV[$id]}, outside LVM)")"
+    done
+    if (( ${#SRC_LIST[@]} + pn )); then step_done "${#SRC_LIST[@]} LVM source(s) ~$(human "$total"), $pn filesystem(s) outside LVM can grow"
+    else step_done "nothing found"; fi
 }
 
 discover_lvm() {
     local name vg size free pestart ext count path attr lv
+    vshow "pvs -o pv_name,vg_name,pv_size,pv_free,dev_size,pe_start"
+    vshow "vgs -o vg_name,vg_size,vg_free,vg_extent_size,pv_count"
+    vshow "lvs -o vg_name,lv_name,lv_size,lv_attr,lv_path"
     while IFS='|' read -r name vg size _ _ pestart; do
         [[ -n $name ]] || continue
         PV_LIST+=("$name"); PV_VG[$name]=$vg; PV_SIZE[$name]=$size; PV_PESTART[$name]=$pestart
@@ -417,8 +564,10 @@ discover_lv_usage() {
             fi
         done
         [[ -n ${LV_FS[$key]} ]] && continue
+        vshow "blkid $fsdev"
         fs=$(blkid -o value -s TYPE "$fsdev" 2>/dev/null)
         mnt=""; use=""
+        vshow "findmnt --source $fsdev"
         if [[ $fs == swap ]]; then
             grep -q "^$(readlink -f "$fsdev") " /proc/swaps 2>/dev/null && mnt="[SWAP]"
         elif [[ -n $fs ]]; then
@@ -543,6 +692,153 @@ free_gap() {   # free_gap DISK START END PREV_PART
 }
 
 # --------------------------------------------------------------------------
+# filesystems outside LVM (plain partitions, whole disks, LUKS, mdraid)
+#   they can only grow into unallocated space directly after their partition
+# --------------------------------------------------------------------------
+
+declare -a PL_LIST
+declare -A PL_DEV PL_FS PL_MNT PL_SIZE PL_USE PL_GAIN PL_STEPS PL_VERIFY PL_DISKS PL_WHY PL_LAYOUT
+
+describe_dev() {   # short description of what is on a block device
+    local dev=$1 vg t m
+    vg=$(pvs --noheadings -o vg_name "$dev" 2>/dev/null | tr -d ' ')
+    if pvs "$dev" >/dev/null 2>&1; then echo "LVM physical volume${vg:+ of volume group $vg}"; return; fi
+    t=$(blkid -o value -s TYPE "$dev" 2>/dev/null)
+    m=$(findmnt -n -o TARGET --source "$dev" 2>/dev/null | head -n1)
+    echo "${t:-unknown content}${m:+ on $m}"
+}
+
+fs_bytes() {   # fs_bytes DEV FSTYPE MOUNTPOINT -> size of the filesystem itself (if known)
+    case $2 in
+        ext2|ext3|ext4) ext_fs_bytes "$1" ;;
+        xfs) [[ -n $3 ]] && xfs_info "$3" 2>/dev/null | awk '/^data/ {
+                 for (i = 1; i <= NF; i++) {
+                     if ($i ~ /^bsize=/) { split($i, a, "="); b = a[2] }
+                     if ($i ~ /^blocks=/) { split($i, c, "="); n = c[2]; sub(/,/, "", n) }
+                 } } END { if (b && n) printf "%.0f\n", b * n }' ;;
+    esac
+}
+
+# layout of a device: "partition 1 of /dev/sda", "LUKS on /dev/sdb1", ...
+dev_layout() {
+    local k=$1 uuid
+    if is_partition "$k"; then echo "partition $(part_num "$k") of /dev/$(part_disk "$k")"
+    elif [[ -d /sys/block/$k/md ]]; then echo "RAID $(cat "/sys/block/$k/md/level" 2>/dev/null)"
+    elif [[ -d /sys/block/$k/dm ]]; then
+        uuid=$(cat "/sys/block/$k/dm/uuid" 2>/dev/null)
+        [[ $uuid == CRYPT-* ]] && echo "LUKS ($(cat "/sys/block/$k/dm/name"))" || echo "device-mapper"
+    else echo "whole disk"; fi
+}
+
+plain_allowed() {   # is this device a disk/partition/md/LUKS we handle (and not LVM)?
+    local k=$1 uuid s
+    if [[ -d /sys/block/$k/dm ]]; then
+        uuid=$(cat "/sys/block/$k/dm/uuid" 2>/dev/null)
+        [[ $uuid == CRYPT-* ]] || return 1
+        for s in /sys/block/"$k"/slaves/*; do
+            [[ -e $s ]] || continue
+            [[ $(cat "$s/dm/uuid" 2>/dev/null) == LVM-* ]] && return 1   # LUKS on an LV: handled via the LV
+        done
+        return 0
+    fi
+    [[ -d /sys/block/$k/md ]] && return 0
+    local disks
+    disks=" $(list_disks | tr '\n' ' ') "
+    if is_partition "$k"; then
+        [[ $disks == *" $(part_disk "$k") "* ]]
+    else
+        [[ $disks == *" $k "* ]]
+    fi
+}
+
+plain_add() {   # plain_add DEVICE MOUNTPOINT FSTYPE
+    local src=$1 mnt=$2 fs=$3 k id cur gain fsb slack=0 why=""
+    case $fs in squashfs|iso9660|udf|erofs|cramfs) return 0 ;; esac   # read-only by design
+    k=$(kname_of "$src")
+    plain_allowed "$k" || return 0
+    id="fs:$mnt"
+    [[ -n ${PL_DEV[$id]:-} ]] && return 0
+    cur=$(dev_bytes "$k")
+    CH_STEPS="" CH_NOTE="" CH_DISKS="" CH_VERIFY="" CH_BLOCKER=""
+    grow_layer "$k"
+    gain=$(( NEWSIZE - cur ))
+    if [[ $fs != swap ]]; then
+        fsb=$(fs_bytes "$src" "$fs" "$( [[ $mnt == /* ]] && echo "$mnt")")
+        [[ $fsb =~ ^[0-9]+$ ]] && (( cur - fsb >= 32 * MiB )) && slack=$(( cur - fsb ))
+    fi
+    case $fs in
+        ext2|ext3|ext4|xfs|btrfs|swap) ;;
+        *) why="the '$fs' filesystem cannot be grown by dskxp"; gain=0; slack=0 ;;
+    esac
+    if [[ -z $why ]] && (( gain + slack < MiB )); then
+        why=${CH_BLOCKER:-${CH_NOTE%; }}
+        if [[ -z $why ]]; then
+            if is_partition "$k"; then why="there is no unallocated space directly after it"
+            else why="it already uses the whole device"; fi
+        fi
+        gain=0; slack=0
+    fi
+    PL_LIST+=("$id")
+    PL_DEV[$id]=$src; PL_FS[$id]=$fs; PL_MNT[$id]=$mnt; PL_SIZE[$id]=$cur
+    PL_GAIN[$id]=$(( gain + slack )); PL_WHY[$id]=$why; PL_LAYOUT[$id]=$(dev_layout "$k")
+    PL_STEPS[$id]=$CH_STEPS; PL_VERIFY[$id]=$CH_VERIFY; PL_DISKS[$id]=$CH_DISKS
+    PL_USE[$id]=""
+    [[ $mnt == /* ]] && PL_USE[$id]=$(df -P "$mnt" 2>/dev/null | awk 'NR == 2 { print $5 }')
+    [[ -n $CH_NOTE && -z $why ]] && NOTES+=("$mnt: ${CH_NOTE%; }")
+    return 0
+}
+
+discover_plain() {
+    local src mnt fs type saved
+    declare -gA PL_DEV=() PL_FS=() PL_MNT=() PL_SIZE=() PL_USE=() PL_GAIN=() PL_STEPS=() PL_VERIFY=() PL_DISKS=() PL_WHY=() PL_LAYOUT=()
+    PL_LIST=()
+    # remember which partitions LVM sources cover; plain growth must not hide free areas
+    saved=$(declare -p COVERED)
+    vshow "findmnt -rn -o SOURCE,TARGET,FSTYPE"
+    while read -r src mnt fs; do
+        printf -v src '%b' "$src"; printf -v mnt '%b' "$mnt"
+        src=${src%%\[*}
+        [[ $src == /dev/* && -b $src ]] || continue
+        plain_add "$src" "$mnt" "$fs"
+    done < <(findmnt -rn -o SOURCE,TARGET,FSTYPE 2>/dev/null)
+    while read -r src type _; do
+        [[ $type == partition && -b $src ]] || continue
+        plain_add "$src" "[SWAP] $src" swap
+    done < <(tail -n +2 /proc/swaps 2>/dev/null)
+    eval "${saved/declare -A/declare -gA}"
+}
+
+plan_extend_plain() {   # plan_extend_plain ID
+    local id=$1 dev mnt fs d fsb uuid label active=0
+    dev=${PL_DEV[$id]}; mnt=${PL_MNT[$id]}; fs=${PL_FS[$id]}
+    PLAN_TITLE="Grow $mnt ($dev) by ~$(human "${PL_GAIN[$id]}")"
+    PLAN_DISKS=${PL_DISKS[$id]}; PLAN_PLAIN=$id; PLAN_AMOUNT=all
+    for d in $PLAN_DISKS; do plan_backup_disk "$d"; done
+    add_verify_lines "${PL_VERIFY[$id]}"
+    if [[ $fs == swap ]]; then
+        uuid=$(blkid -o value -s UUID "$dev" 2>/dev/null); label=$(blkid -o value -s LABEL "$dev" 2>/dev/null)
+        [[ $mnt == "[SWAP]"* ]] && active=1
+        (( active )) && add_step "Turn off swap on $dev (needs enough free RAM)" "swapoff $dev"
+        plan_steps_from "${PL_STEPS[$id]}"
+        add_step "Recreate the swap signature with the same UUID" "mkswap ${uuid:+-U $uuid }${label:+-L $(q "$label") }$dev"
+        (( active )) && add_step "Turn swap back on" "swapon $dev"
+        [[ -n $uuid ]] && add_verify swapuuid "$dev" "$uuid" "" "swap on $dev kept its UUID $uuid"
+        (( active )) && add_verify swapon "$dev" "" "" "swap on $dev is active again"
+        return 0
+    fi
+    plan_steps_from "${PL_STEPS[$id]}"
+    plan_fs_grow "$dev" "$fs" "$mnt"
+    fsb=$(df -B1 --output=size "$mnt" 2>/dev/null | tail -n1 | tr -d ' ')
+    [[ $fsb =~ ^[0-9]+$ ]] && add_verify fs "$mnt" "$fsb" "${PL_SIZE[$id]}:$dev" "filesystem on $mnt grew along with $dev"
+}
+
+plain_line() {   # one line for menus / overview
+    local id=$1
+    printf '%-26s %9s  %-6s %-22s %4s  %s' "${PL_MNT[$id]%% *}" "$(human "${PL_SIZE[$id]}")" "${PL_FS[$id]}" \
+        "${PL_DEV[$id]}" "${PL_USE[$id]:--}" "$( if (( ${PL_GAIN[$id]} > 0 )); then echo "can grow ~$(human "${PL_GAIN[$id]}")"; else echo "cannot grow"; fi)"
+}
+
+# --------------------------------------------------------------------------
 # overview
 # --------------------------------------------------------------------------
 
@@ -585,6 +881,16 @@ overview() {
                 "${LV_FS[$key]:--}${LV_CRYPT[$key]:+ (luks)}" "${LV_MNT[$key]:--}" "${LV_USE[$key]:-}"
         done
     fi
+    if (( ${#PL_LIST[@]} > 0 )); then
+        local pid
+        echo
+        echo "FILESYSTEMS OUTSIDE LVM"
+        printf '  %-26s %9s  %-6s %-22s %4s  %s\n' MOUNTPOINT SIZE FS DEVICE USED GROW
+        for pid in "${PL_LIST[@]}"; do
+            printf '  %s\n' "$(plain_line "$pid")"
+            [[ -n ${PL_WHY[$pid]} ]] && printf '  %26s   -> %s\n' "" "${PL_WHY[$pid]}"
+        done
+    fi
     if (( ${#NOTES[@]} > 0 )); then
         echo
         echo "NOTES"
@@ -600,13 +906,13 @@ declare -a PLAN_DESC PLAN_CMD PLAN_NOTES PLAN_NEWPVS PLAN_VERIFY
 declare -A PLAN_RES
 PLAN_TITLE=""
 # context used by the preflight check
-PLAN_VG="" PLAN_NEWVG=0 PLAN_LV="" PLAN_DISKS="" PLAN_AMOUNT=all PLAN_AVAIL=0 PLAN_NSRC=0
+PLAN_VG="" PLAN_NEWVG=0 PLAN_LV="" PLAN_DISKS="" PLAN_AMOUNT=all PLAN_AVAIL=0 PLAN_NSRC=0 PLAN_PLAIN=""
 
 plan_reset() {
     PLAN_DESC=() PLAN_CMD=() PLAN_NOTES=() PLAN_NEWPVS=() PLAN_VERIFY=()
     declare -gA PLAN_RES=()
     PLAN_TITLE=""
-    PLAN_VG="" PLAN_NEWVG=0 PLAN_LV="" PLAN_DISKS="" PLAN_AMOUNT=all PLAN_AVAIL=0 PLAN_NSRC=0
+    PLAN_VG="" PLAN_NEWVG=0 PLAN_LV="" PLAN_DISKS="" PLAN_AMOUNT=all PLAN_AVAIL=0 PLAN_NSRC=0 PLAN_PLAIN=""
 }
 add_verify() { PLAN_VERIFY+=("$1$US$2$US$3$US$4$US$5"); }   # kind a b c description
 add_verify_lines() {
@@ -971,6 +1277,7 @@ PF_LINES=() PF_MISSING=()
 PF_TOOLS="sfdisk partx pvresize pvcreate vgextend vgcreate lvextend lvcreate resize2fs e2fsck xfs_growfs btrfs cryptsetup mdadm mkswap swapon swapoff mkfs.ext4 mkfs.xfs mkfs.btrfs blkid mount"
 
 have()    { command -v "$1" >/dev/null 2>&1; }
+help_has() { local h; h=$("$1" --help 2>&1); [[ $h == *"$2"* ]]; }   # no pipe: grep -q + pipefail can fail on SIGPIPE
 pf_reset(){ PF_SCORE=100 PF_FAILS=0 PF_WARNS=0; PF_LINES=(); PF_MISSING=(); }
 pf_ok()   { PF_LINES+=("[ OK ] $1"); }
 pf_info() { PF_LINES+=("[INFO] $1"); }
@@ -1005,7 +1312,7 @@ preflight() {
     fi
 
     if grep -qE -- '--no-tell-kernel|--relocate' <<<"$all"; then
-        if sfdisk --help 2>&1 | grep -q -- '--no-tell-kernel' && sfdisk --help 2>&1 | grep -q -- '--relocate'; then
+        if help_has sfdisk --no-tell-kernel && help_has sfdisk --relocate; then
             pf_ok "sfdisk supports online partition resizing"
         else
             pf_fail "sfdisk is too old for online partition resizing (util-linux 2.29 or newer needed)"
@@ -1027,6 +1334,7 @@ preflight() {
 
     for d in $PLAN_DISKS; do pf_disk "$d"; done
     [[ -n $PLAN_LV ]] && pf_target_lv "$PLAN_LV"
+    [[ -n $PLAN_PLAIN ]] && pf_target_plain "$PLAN_PLAIN"
 
     if [[ $PLAN_AMOUNT != all ]] && (( PLAN_NSRC > 0 && PLAN_AVAIL > 0 && PLAN_AMOUNT * 100 > PLAN_AVAIL * 97 )); then
         pf_warn 10 "the requested size is within 3% of the estimated maximum; estimates can be a few MB off - consider 'all'"
@@ -1037,7 +1345,7 @@ preflight() {
     grep -qE '(^|[;&|{ ])(mkfs\.)?btrfs' <<<"$all" && pf_warn 10 "btrfs is not covered by the automated tests yet"
 
     if grep -q '>> /etc/fstab' <<<"$all"; then
-        if ! findmnt --help 2>&1 | grep -q -- '--verify'; then
+        if ! help_has findmnt --verify; then
             pf_info "findmnt is too old to verify /etc/fstab"
         elif findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then
             pf_ok "/etc/fstab has no errors (findmnt --verify)"
@@ -1087,8 +1395,32 @@ pf_disk() {
 }
 
 pf_target_lv() {
-    local key=$1 fs mnt fsdev opts info state errs used avail meta
-    fs=${LV_FS[$key]}; mnt=${LV_MNT[$key]}; fsdev=${LV_FSDEV[$key]}
+    local key=$1 meta
+    pf_fs_checks "${LV_FS[$key]}" "${LV_MNT[$key]}" "${LV_FSDEV[$key]}" "$key"
+    if [[ ${LV_ATTR[$key]:0:1} == t ]]; then
+        meta=$(lvs --noheadings -o metadata_percent "$key" 2>/dev/null | tr -d ' ')
+        if [[ $meta =~ ^[0-9]+ ]] && (( ${meta%%.*} >= 80 )); then
+            pf_warn 10 "thin pool metadata of $key is ${meta}% full"
+        fi
+    fi
+    [[ ${LV_ATTR[$key]:0:1} == o ]] && pf_info "$key has LVM snapshots; they keep working"
+    return 0
+}
+
+pf_target_plain() {
+    local id=$1 mnt=${PL_MNT[$1]}
+    [[ $mnt == "[SWAP]"* ]] && mnt="[SWAP]"
+    pf_fs_checks "${PL_FS[$id]}" "$mnt" "${PL_DEV[$id]}" "${PL_DEV[$id]}"
+    if (( ${PL_GAIN[$id]} <= 0 )); then
+        pf_fail "${PL_MNT[$id]} cannot grow: ${PL_WHY[$id]}"
+    else
+        pf_ok "~$(human "${PL_GAIN[$id]}") of unallocated space directly after ${PL_DEV[$id]}"
+    fi
+    pf_info "filesystems outside LVM always get all the space directly after their partition"
+}
+
+pf_fs_checks() {   # pf_fs_checks FSTYPE MOUNTPOINT DEVICE LABEL
+    local fs=$1 mnt=$2 fsdev=$3 key=$4 opts info state errs used avail
     if [[ -n $mnt && $mnt != "[SWAP]" ]]; then
         opts=$(findmnt -n -o OPTIONS "$mnt" 2>/dev/null | head -n1)
         if [[ ,$opts, == *,ro,* ]]; then
@@ -1127,13 +1459,6 @@ pf_target_lv() {
         \(*) ;;
         *) pf_warn 30 "filesystem '$fs' on $key is not grown automatically" ;;
     esac
-    if [[ ${LV_ATTR[$key]:0:1} == t ]]; then
-        meta=$(lvs --noheadings -o metadata_percent "$key" 2>/dev/null | tr -d ' ')
-        if [[ $meta =~ ^[0-9]+ ]] && (( ${meta%%.*} >= 80 )); then
-            pf_warn 10 "thin pool metadata of $key is ${meta}% full"
-        fi
-    fi
-    [[ ${LV_ATTR[$key]:0:1} == o ]] && pf_info "$key has LVM snapshots; they keep working"
     return 0
 }
 
@@ -1194,7 +1519,8 @@ verify_one() {   # verify_one KIND A B C -> 0 ok, sets VF_DETAIL
         exists) lvs "$a" >/dev/null 2>&1 ;;
         fs|extfs)
                 lvb=${c%%:*}; key=${c#*:}
-                lva=$(lvs --noheadings --units b --nosuffix -o lv_size "$key" 2>/dev/null | tr -d ' ')
+                if [[ $key == /dev/* ]]; then lva=$(vf_size "$key")
+                else lva=$(lvs --noheadings --units b --nosuffix -o lv_size "$key" 2>/dev/null | tr -d ' '); fi
                 if [[ $kind == fs ]]; then fsa=$(df -B1 --output=size "$a" 2>/dev/null | tail -n1 | tr -d ' ')
                 else fsa=$(ext_fs_bytes "$a"); fi
                 delta=$(( ${lva:-0} - lvb ))
@@ -1207,7 +1533,7 @@ verify_one() {   # verify_one KIND A B C -> 0 ok, sets VF_DETAIL
                 VF_DETAIL="${v:-not mounted}"
                 [[ -n $v && $(readlink -f "$v") == "$(readlink -f "$b")" ]] ;;
         fstab)  findmnt -s -n "$a" >/dev/null 2>&1 &&
-                { ! findmnt --help 2>&1 | grep -q -- '--verify' || findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; } ;;
+                { ! help_has findmnt --verify || findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; } ;;
         fstabuuid) uuid=$(blkid -o value -s UUID "$a" 2>/dev/null); [[ -n $uuid ]] && grep -q "UUID=$uuid" /etc/fstab ;;
         *) VF_DETAIL="unknown check"; return 1 ;;
     esac
@@ -1278,8 +1604,29 @@ check_report() {
         fi
     done
     (( ${#LV_LIST[@]} > 0 )) || echo "  (no logical volumes)"
+    if (( ${#PL_LIST[@]} > 0 )); then
+        local pid
+        echo
+        printf '  %-28s %10s %8s  %s\n' "OUTSIDE LVM" "EXTRA" "CHANCE" "REMARKS"
+        for pid in "${PL_LIST[@]}"; do
+            if (( ${PL_GAIN[$pid]} <= 0 )); then
+                printf '  %-28s %10s %8s  %s\n' "${PL_MNT[$pid]%% *}" "0" "-" "${PL_WHY[$pid]}"
+                continue
+            fi
+            plan_reset; plan_extend_plain "$pid"; preflight
+            remark=""
+            for line in "${PF_LINES[@]}"; do
+                [[ $line == "[FAIL]"* || $line == "[WARN]"* ]] && remark+="${remark:+; }${line#\[????\] }"
+            done
+            if (( PF_FAILS > 0 )); then
+                printf '  %-28s %10s %8s  %s\n' "${PL_MNT[$pid]%% *}" "~$(human "${PL_GAIN[$pid]}")" "BLOCKED" "$remark"
+            else
+                printf '  %-28s %10s %7s%%  %s\n' "${PL_MNT[$pid]%% *}" "~$(human "${PL_GAIN[$pid]}")" "$(pf_result)" "${remark:-all checks OK}"
+            fi
+        done
+    fi
     echo
-    echo "Details for one volume: dskxp --extend VG/LV --dry-run"
+    echo "Details for one volume: dskxp --extend VG/LV --dry-run  (or --extend /mountpoint)"
 }
 
 execute_plan() {
@@ -1554,9 +1901,14 @@ flow_extend() {
         args+=("$key" "$(printf '%-26s %9s  %-10s %-18s %s' "$key" "$(human "${LV_SIZE[$key]}")" \
             "${LV_FS[$key]:--}" "${LV_MNT[$key]:--}" "${LV_USE[$key]:+${LV_USE[$key]} used}")")
     done
-    (( ${#args[@]} > 0 )) || { ui_msg "No logical volumes" "No logical volumes were found."; return; }
-    ui_menu "Extend a logical volume" "Which logical volume (mount point) needs more space?" "${args[@]}" || return
-    key=$UI_REPLY; vg=${key%%/*}
+    for key in "${PL_LIST[@]}"; do
+        args+=("$key" "$(plain_line "$key")  [outside LVM]")
+    done
+    (( ${#args[@]} > 0 )) || { ui_msg "Nothing to extend" "No logical volumes or filesystems were found."; return; }
+    ui_menu "Extend a volume or filesystem" "Which mount point needs more space?" "${args[@]}" || return
+    key=$UI_REPLY
+    if [[ $key == fs:* ]]; then flow_extend_plain "$key"; return; fi
+    vg=${key%%/*}
     select_sources "$vg" || return
     gain=$(sources_gain "${SEL_SOURCES[@]}")
     avail=$(( ${VG_FREE[$vg]} + gain ))
@@ -1571,6 +1923,19 @@ Enlarge the disk in your hypervisor (or add a disk), then choose 'Rescan disks'.
     plan_reset
     plan_sources "$vg" 0 "${SEL_SOURCES[@]}"
     plan_extend_lv "$key" "$amount"
+    execute_plan && after_run
+}
+
+flow_extend_plain() {
+    local id=$1
+    if (( ${PL_GAIN[$id]} <= 0 )); then
+        ui_msg "Cannot grow ${PL_MNT[$id]%% *}" "${PL_MNT[$id]%% *} is on ${PL_DEV[$id]} (${PL_LAYOUT[$id]}, outside LVM).
+
+It cannot grow: ${PL_WHY[$id]}."
+        return
+    fi
+    plan_reset
+    plan_extend_plain "$id"
     execute_plan && after_run
 }
 
@@ -1698,7 +2063,9 @@ on some older systems a reboot is needed.}"
 interactive() {
     offer_whiptail
     ui_init
-    discover
+    if [[ $UI == whiptail ]] && (( ! OPT_QUIET )); then
+        read -r -p "Press Enter to open the menu... " _ </dev/tty || true
+    fi
     local head="Disks were rescanned. ${RESCAN_REPORT:+Changes:
 $RESCAN_REPORT}"
     ui_text "dskxp $VERSION - storage overview" "$( (( OPT_RESCAN )) && printf '%s\n\n' "$head"; overview)"
@@ -1751,8 +2118,17 @@ resolve_sources() {   # resolve_sources VG -> SEL_SOURCES (VG="" for a new VG)
 }
 
 cli_extend() {
-    local key=$TARGET vg avail amount
-    [[ -n ${LV_SIZE[$key]:-} ]] || die "logical volume '$key' not found (use VG/LV, see 'dskxp --list')"
+    local key=$TARGET vg avail amount t
+    if [[ $key == /* ]]; then
+        t=${key%/}; [[ -z $t ]] && t=/
+        for vg in "${LV_LIST[@]}"; do [[ ${LV_MNT[$vg]} == "$t" ]] && key=$vg; done
+        if [[ $key == /* ]]; then
+            [[ -n ${PL_DEV["fs:$t"]:-} ]] || die "nothing is mounted on $t (see 'dskxp --list')"
+            cli_extend_plain "fs:$t"
+            return
+        fi
+    fi
+    [[ -n ${LV_SIZE[$key]:-} ]] || die "logical volume '$key' not found (use VG/LV or a mount point, see 'dskxp --list')"
     vg=${key%%/*}
     resolve_sources "$vg"
     avail=$(( ${VG_FREE[$vg]} + $(sources_gain "${SEL_SOURCES[@]}") ))
@@ -1767,6 +2143,16 @@ cli_extend() {
     plan_reset
     plan_sources "$vg" 0 "${SEL_SOURCES[@]}"
     plan_extend_lv "$key" "$amount"
+    execute_plan
+}
+
+cli_extend_plain() {
+    local id=$1
+    (( ${PL_GAIN[$id]} > 0 )) || die "${PL_MNT[$id]} (${PL_DEV[$id]}) cannot grow: ${PL_WHY[$id]}"
+    [[ $OPT_SIZE == all ]] || die "${PL_MNT[$id]} is outside LVM: it always gets all the space directly after its partition (~$(human "${PL_GAIN[$id]}")); leave out --size"
+    (( ${#OPT_USE[@]} == 0 )) || die "--use only applies to LVM volumes"
+    plan_reset
+    plan_extend_plain "$id"
     execute_plan
 }
 
@@ -1814,7 +2200,10 @@ Usage:
   dskxp --list                  show disks, free space, volume groups and volumes
   dskxp --check                 preflight check for every logical volume: how
                                 much can be added and the estimated chance of success
-  dskxp --extend VG/LV [options]
+  dskxp --extend VG/LV|/MOUNTPOINT [options]
+                                grow a logical volume, or a filesystem outside LVM
+                                (e.g. / on /dev/sda1) when there is free space
+                                directly after its partition
   dskxp --create VG/LV [--fs ext4|xfs|btrfs|swap|none] [--mount DIR] [options]
   dskxp --add VG [options]      only add space to a (new) volume group
   dskxp --rescan                only rescan the disks and show what changed
@@ -1835,6 +2224,8 @@ Options:
                       menu, and never installs anything in --yes or --dry-run mode
       --no-rescan     do not rescan the disks at startup
       --text          plain text prompts instead of whiptail
+  -v, --verbose       at startup also show every (read-only) command dskxp runs
+  -q, --quiet         do not show the startup overview
   -h, --help          this help
   -V, --version       show the version
 
@@ -1865,6 +2256,8 @@ parse_args() {
             -c|--check)    ACTION=check ;;
             --force)       OPT_FORCE=1 ;;
             --install-missing) OPT_INSTALL=1 ;;
+            -v|--verbose)  OPT_VERBOSE=1 ;;
+            -q|--quiet)    OPT_QUIET=1 ;;
             -s|--size)     OPT_SIZE=${2:?--size needs a value}; shift ;;
             -u|--use)      OPT_USE+=("${2:?--use needs a value}"); shift ;;
             --fs)          OPT_FS=${2:?--fs needs a value}; shift ;;
@@ -1882,11 +2275,16 @@ parse_args() {
     done
 }
 
-check_requirements() {
-    local c missing=() hint
+missing_basics() {
+    local c
     for c in sfdisk partx blkid findmnt awk pvs vgs lvs pvresize lvextend; do
-        have "$c" || missing+=("$c")
+        have "$c" || echo "$c"
     done
+}
+
+check_requirements() {
+    local missing=() hint
+    mapfile -t missing < <(missing_basics)
     (( ${#missing[@]} )) || return 0
     # interactive start (no action given) may ask; command line mode only with --install-missing
     if [[ -z $ACTION ]] || (( OPT_INSTALL )); then
@@ -1912,21 +2310,38 @@ That works fine; whiptail only makes it look nicer." whiptail || true
 main() {
     parse_args "$@"
     (( EUID == 0 )) || die "must be run as root (try: sudo $0)"
-    check_requirements
+    [[ $ACTION == rescan ]] && P_TOTAL=2
+    progress_start
+    step "Checking required tools"
+    if [[ -z $(missing_basics) ]]; then
+        step_done "ok (util-linux, lvm2$(have whiptail && printf ', whiptail'))"
+    else
+        p_break
+        check_requirements
+        step_done "ok after installing"
+    fi
     if command -v flock >/dev/null; then
         exec 9>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
         flock -n 9 || die "another dskxp is already running"
     fi
-    (( OPT_RESCAN )) && rescan_disks
+    step "Rescanning disks"
+    if (( OPT_RESCAN )); then
+        rescan_disks
+        if [[ -n $RESCAN_REPORT ]]; then step_done "changes found"; else step_done "no changes"; fi
+    else
+        step_done "skipped (--no-rescan)"
+    fi
+    [[ $ACTION == rescan ]] || discover
+    progress_end
     [[ -n $ACTION ]] && UI=text   # command line mode never uses whiptail
     case $ACTION in
         "")     interactive ;;
-        list)   discover; overview ;;
-        check)  discover; check_report ;;
+        list)   overview ;;
+        check)  check_report ;;
         rescan) printf '%s\n' "${RESCAN_REPORT:-No size changes or new disks detected.}" ;;
-        extend) discover; cli_extend ;;
-        create) discover; cli_create ;;
-        add)    discover; cli_add ;;
+        extend) cli_extend ;;
+        create) cli_create ;;
+        add)    cli_add ;;
     esac
 }
 

@@ -17,6 +17,40 @@ sudo dskxp
    estimated chance of success. Nothing changes until you confirm.
 6. Afterwards it **verifies** every change and reports `OK` / `FAIL` per item.
 
+## What you see when it starts
+
+dskxp first shows what it is doing, step by step (on stderr, so the output of
+`--list` and `--check` stays clean for scripts):
+
+```
+dskxp 0.2.0 - starting
+[1/6] Checking required tools .............. ok (util-linux, lvm2, whiptail)
+[2/6] Rescanning disks
+      SCSI hosts scanned for new disks: host0 host1 host2
+      disks asked for their current size: sda sdb
+      /dev/sda: GREW 20.0G -> 60.0G
+      => changes found
+[3/6] Reading partition tables
+      /dev/sda            60.0G  gpt, 3 partition(s)
+      => 1 disk(s)
+[4/6] Reading LVM .......................... 1 VG, 1 PV, 2 LV
+[5/6] Checking filesystems and mounts
+      rl/root                     17.0G  xfs on / (92% used)
+      rl/swap                      2.0G  swap on [SWAP]
+      => 1 filesystem(s)
+[6/6] Looking for free space
+         ~40.0G  grow /dev/sda3 (volume group rl)
+      => 1 source(s), ~40.0G
+Done in 1.2s
+Press Enter to open the menu...
+```
+
+- `-v` / `--verbose` also shows every read-only command it runs
+  (`sfdisk -d`, `pvs`, `blkid`, the rescan writes in `/sys`, ...).
+- `-q` / `--quiet` hides the overview.
+- Every step is also written to `/var/log/dskxp.log`.
+- While a plan runs you see every step with its exact command and output.
+
 ## What it can do
 
 | Situation | What dskxp does |
@@ -31,6 +65,34 @@ sudo dskxp
 | Extend a logical volume | `lvextend` + grow the filesystem: ext2/3/4 (`resize2fs`), XFS (`xfs_growfs`), btrfs, swap (keeps its UUID), LUKS on top of the LV |
 | New logical volume | `lvcreate` → `mkfs` (ext4/xfs/btrfs/swap) → mount point → `/etc/fstab` (by UUID) |
 | Thin pools (e.g. Proxmox `pve/data`) | `lvextend` of the pool |
+| Filesystem **outside LVM** on the last partition (e.g. `/` on `sda1` in cloud images), on a whole disk, on LUKS or mdraid | grow partition (and LUKS / RAID) → grow the filesystem (ext*, XFS, btrfs, swap) |
+
+### Filesystems outside LVM (e.g. `/boot`)
+
+A filesystem on a plain partition can only grow into unallocated space
+**directly after** its partition — it always gets all of that space. On most
+installations `/boot` is followed by the LVM partition:
+
+```
+sda1  /boot        <- cannot grow: sda2 sits right after it
+sda2  LVM (rl)
+      [new space]  <- goes to LVM
+```
+
+Growing `/boot` would mean moving the LVM partition (offline, risky), so dskxp
+does not do that; it tells you exactly why instead:
+
+```
+FILESYSTEMS OUTSIDE LVM
+  MOUNTPOINT        SIZE  FS     DEVICE      USED  GROW
+  /boot             1.0G  xfs    /dev/sda1    35%  cannot grow
+                    -> /dev/sda1 is directly followed by /dev/sda2 (LVM physical volume of
+                       volume group rl); growing it would mean moving that partition, which
+                       dskxp does not do
+```
+
+If a previous run grew the partition but not the filesystem, dskxp notices
+the filesystem is smaller than its partition and offers to finish the job.
 
 ## Preflight check, verification and `--check`
 
@@ -135,6 +197,8 @@ well (util-linux 2.32+).
 dskxp --list                                       # overview + source IDs
 dskxp --check                                      # chance of success per volume
 dskxp --extend ubuntu-vg/ubuntu-lv --dry-run       # show what would happen
+dskxp --extend /var --size 10G                     # by mount point (LV is looked up)
+dskxp --extend /                                   # / outside LVM: all space after its partition
 dskxp --extend rl/root --size 20G --yes            # grow / by 20G
 dskxp --extend vg0/var --use pv:/dev/sda3 --use disk:/dev/sdb
 dskxp --create data-vg/backup --use /dev/sdb --fs xfs --mount /backup --yes
