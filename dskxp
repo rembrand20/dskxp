@@ -11,7 +11,7 @@
 set -o pipefail
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROG=dskxp
 
 LOG_FILE=${DSKXP_LOG:-/var/log/dskxp.log}
@@ -27,6 +27,8 @@ OPT_DRY_RUN=0
 OPT_YES=0
 OPT_FORCE=0
 OPT_INSTALL=0
+OPT_VERBOSE=0
+OPT_QUIET=0
 OPT_RESCAN=1
 OPT_UI=auto
 OPT_SIZE=all
@@ -80,7 +82,7 @@ part_disk()    { basename "$(dirname "$(readlink -f "/sys/class/block/$1")")"; }
 part_num()     { cat "/sys/class/block/$1/partition"; }
 dev_bytes()    { echo $(( $(cat "/sys/class/block/$1/size" 2>/dev/null || echo 0) * 512 )); }
 has_holders()  { local h; for h in /sys/class/block/"$1"/holders/*; do [[ -e $h ]] && return 0; done; return 1; }
-has_signature(){ blkid -p "/dev/$1" >/dev/null 2>&1; }
+has_signature(){ vshow "blkid -p /dev/$1"; blkid -p "/dev/$1" >/dev/null 2>&1; }
 is_mounted()   { findmnt -n --source "/dev/$1" >/dev/null 2>&1 || grep -q "^/dev/$1 " /proc/swaps 2>/dev/null; }
 
 part_path() {   # part_path DISK NUM
@@ -101,6 +103,78 @@ list_disks() {
 }
 
 # --------------------------------------------------------------------------
+# startup progress (stderr, so --list / --check output stays clean)
+# --------------------------------------------------------------------------
+
+PROGRESS=0 P_N=0 P_TOTAL=6 P_OPEN=0 P_T0=0 P_TS=0
+
+now_ms() {
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        local t=${EPOCHREALTIME/[.,]/}
+        echo $(( t / 1000 ))
+    else
+        echo $(( $(date +%s%N) / 1000000 ))
+    fi
+}
+
+secs() { awk -v ms="$1" 'BEGIN { printf "%.1fs", ms / 1000 }'; }
+
+p_break() { if (( P_OPEN )); then printf '\n' >&2; P_OPEN=0; fi; }
+
+step() {   # step LABEL
+    (( PROGRESS )) || return 0
+    P_N=$(( P_N + 1 )); P_TS=$(now_ms)
+    local head
+    head=$(printf '[%d/%d] %s ' "$P_N" "$P_TOTAL" "$1")
+    log "step $P_N/$P_TOTAL: $1"
+    if (( OPT_VERBOSE )); then
+        printf '%s\n' "$head" >&2
+    else
+        printf '%s' "$head" >&2; P_OPEN=1
+        P_HEADLEN=${#head}
+    fi
+}
+
+step_done() {   # step_done RESULT
+    (( PROGRESS )) || return 0
+    local took dots="" n
+    took=$(( $(now_ms) - P_TS ))
+    local res=$1
+    (( took >= 500 )) && res+=" ($(secs "$took"))"
+    log "  -> $res"
+    if (( P_OPEN )); then
+        n=$(( 44 - P_HEADLEN )); (( n < 3 )) && n=3
+        printf -v dots '%*s' "$n" ''; dots=${dots// /.}
+        printf '%s %s\n' "$dots" "$res" >&2
+        P_OPEN=0
+    else
+        printf '      => %s\n' "$res" >&2
+    fi
+}
+
+p_detail() {   # extra line under the current step
+    (( PROGRESS )) || return 0
+    p_break
+    printf '      %s\n' "$1" >&2
+    log "     $1"
+}
+
+vshow() { (( OPT_VERBOSE )) && p_detail "\$ $*"; return 0; }   # show a read-only command
+
+progress_start() {
+    (( OPT_QUIET )) && return 0
+    PROGRESS=1 P_N=0 P_T0=$(now_ms)
+    printf 'dskxp %s - starting%s\n' "$VERSION" "$( (( OPT_VERBOSE )) && printf ' (verbose: showing every command)')" >&2
+}
+
+progress_end() {
+    (( PROGRESS )) || return 0
+    p_break
+    printf 'Done in %s\n' "$(secs $(( $(now_ms) - P_T0 )))" >&2
+    PROGRESS=0
+}
+
+# --------------------------------------------------------------------------
 # rescan
 # --------------------------------------------------------------------------
 
@@ -112,20 +186,35 @@ rescan_disks() {
     local -A before=()
     for d in $(list_disks); do before[$d]=$(dev_bytes "$d"); done
 
+    local hosts="" disks="" nvme=""
     for f in /sys/class/scsi_host/host*/scan; do
-        [[ -w $f ]] && echo '- - -' >"$f" 2>/dev/null
+        [[ -w $f ]] || continue
+        vshow "echo '- - -' > $f"
+        echo '- - -' >"$f" 2>/dev/null
+        f=${f%/scan}; hosts+="${hosts:+ }${f##*/}"
     done
+    [[ -n $hosts ]] && p_detail "SCSI hosts scanned for new disks: $hosts"
     for d in $(list_disks); do
         if [[ -w /sys/block/$d/device/rescan ]]; then
+            vshow "echo 1 > /sys/block/$d/device/rescan"
             echo 1 >"/sys/block/$d/device/rescan" 2>/dev/null
+            disks+="${disks:+ }$d"
         elif [[ $d == loop* ]]; then
+            vshow "losetup -c /dev/$d"
             losetup -c "/dev/$d" 2>/dev/null
+            disks+="${disks:+ }$d"
         fi
     done
     for c in /sys/class/nvme/nvme*; do
-        [[ -w $c/rescan_controller ]] && echo 1 >"$c/rescan_controller" 2>/dev/null
+        [[ -w $c/rescan_controller ]] || continue
+        vshow "echo 1 > $c/rescan_controller"
+        echo 1 >"$c/rescan_controller" 2>/dev/null
+        nvme+="${nvme:+ }${c##*/}"
     done
-    command -v udevadm >/dev/null && udevadm settle 2>/dev/null
+    [[ -n $disks ]] && p_detail "disks asked for their current size: $disks"
+    [[ -n $nvme ]] && p_detail "NVMe controllers rescanned: $nvme"
+    [[ -z $disks$nvme ]] && p_detail "no disk supports a rescan (virtio disks update their size by themselves)"
+    have udevadm && { vshow "udevadm settle"; udevadm settle 2>/dev/null; }
 
     RESCAN_REPORT=""
     for d in $(list_disks); do
@@ -133,9 +222,11 @@ rescan_disks() {
         if [[ -z ${before[$d]:-} ]]; then
             RESCAN_INFO[$d]="new disk"
             RESCAN_REPORT+="  /dev/$d: new disk, $(human "$now")"$'\n'
+            p_detail "/dev/$d: NEW disk, $(human "$now")"
         elif (( now != before[$d] )); then
             RESCAN_INFO[$d]="was $(human "${before[$d]}")"
             RESCAN_REPORT+="  /dev/$d: $(human "${before[$d]}") -> $(human "$now")"$'\n'
+            p_detail "/dev/$d: GREW $(human "${before[$d]}") -> $(human "$now")"
         fi
     done
     log "rescan: ${RESCAN_REPORT:-no changes}"
@@ -157,6 +248,7 @@ load_disk() {
     DISK_FIRSTLBA[$d]=2048
     DISK_LASTLBA[$d]=0
     DISK_PARTS[$d]=""
+    vshow "sfdisk -d /dev/$d"
     dump=$(sfdisk -d "/dev/$d" 2>/dev/null) || dump=""
     while IFS= read -r line; do
         case $line in
@@ -311,6 +403,7 @@ grow_crypt() {
     fi
     parent=${slaves[0]##*/}
     grow_layer "$parent"; pnew=$NEWSIZE
+    vshow "cryptsetup status $name"
     off=$(cryptsetup status "$name" 2>/dev/null | awk '$1 == "offset:" { print $2 }')
     [[ $off =~ ^[0-9]+$ ]] || off=$(( ($(dev_bytes "$parent") - cur) / 512 ))
     new=$(( pnew - off * 512 ))
@@ -369,15 +462,46 @@ discover() {
     declare -gA SRC_DISK=() SRC_START=() SRC_SECTORS=() COVERED=()
     declare -gA DISK_LOADED=() DISK_LABEL=() DISK_SS=() DISK_SECT=() DISK_FIRSTLBA=() DISK_LASTLBA=() DISK_PARTS=()
     declare -gA PART_START=() PART_SIZE=() PART_TYPE=()
+    local d n cnt=0 key fsn=0 id total=0
 
+    step "Reading partition tables"
+    for d in $(list_disks); do
+        load_disk "$d"; cnt=$(( cnt + 1 ))
+        n=$(wc -w <<<"${DISK_PARTS[$d]}")
+        p_detail "$(printf '/dev/%-10s %9s  %s' "$d" "$(human "$(dev_bytes "$d")")" \
+            "$( [[ ${DISK_LABEL[$d]} == none ]] && echo "no partition table" || echo "${DISK_LABEL[$d]}, $n partition(s)")")"
+    done
+    step_done "$cnt disk(s)"
+
+    step "Reading LVM"
     discover_lvm
+    step_done "${#VG_LIST[@]} VG, ${#PV_LIST[@]} PV, ${#LV_LIST[@]} LV"
+
+    step "Checking filesystems and mounts"
     discover_lv_usage
+    for key in "${LV_LIST[@]}"; do
+        [[ -n ${LV_FS[$key]} && ${LV_FS[$key]} != \(* ]] && fsn=$(( fsn + 1 ))
+        p_detail "$(printf '%-26s %9s  %s' "$key" "$(human "${LV_SIZE[$key]}")" \
+            "${LV_FS[$key]:-no filesystem}${LV_MNT[$key]:+ on ${LV_MNT[$key]}}${LV_USE[$key]:+ (${LV_USE[$key]} used)}")"
+    done
+    step_done "$fsn filesystem(s)"
+
+    step "Looking for free space"
     discover_grow_sources
     discover_free_sources
+    for id in "${SRC_LIST[@]}"; do
+        total=$(( total + ${SRC_GAIN[$id]} ))
+        p_detail "$(printf '%9s  %s' "~$(human "${SRC_GAIN[$id]}")" "${SRC_LABEL[$id]}")"
+    done
+    if (( ${#SRC_LIST[@]} )); then step_done "${#SRC_LIST[@]} source(s), ~$(human "$total")"
+    else step_done "nothing found"; fi
 }
 
 discover_lvm() {
     local name vg size free pestart ext count path attr lv
+    vshow "pvs -o pv_name,vg_name,pv_size,pv_free,dev_size,pe_start"
+    vshow "vgs -o vg_name,vg_size,vg_free,vg_extent_size,pv_count"
+    vshow "lvs -o vg_name,lv_name,lv_size,lv_attr,lv_path"
     while IFS='|' read -r name vg size _ _ pestart; do
         [[ -n $name ]] || continue
         PV_LIST+=("$name"); PV_VG[$name]=$vg; PV_SIZE[$name]=$size; PV_PESTART[$name]=$pestart
@@ -417,8 +541,10 @@ discover_lv_usage() {
             fi
         done
         [[ -n ${LV_FS[$key]} ]] && continue
+        vshow "blkid $fsdev"
         fs=$(blkid -o value -s TYPE "$fsdev" 2>/dev/null)
         mnt=""; use=""
+        vshow "findmnt --source $fsdev"
         if [[ $fs == swap ]]; then
             grep -q "^$(readlink -f "$fsdev") " /proc/swaps 2>/dev/null && mnt="[SWAP]"
         elif [[ -n $fs ]]; then
@@ -1698,7 +1824,9 @@ on some older systems a reboot is needed.}"
 interactive() {
     offer_whiptail
     ui_init
-    discover
+    if [[ $UI == whiptail ]] && (( ! OPT_QUIET )); then
+        read -r -p "Press Enter to open the menu... " _ </dev/tty || true
+    fi
     local head="Disks were rescanned. ${RESCAN_REPORT:+Changes:
 $RESCAN_REPORT}"
     ui_text "dskxp $VERSION - storage overview" "$( (( OPT_RESCAN )) && printf '%s\n\n' "$head"; overview)"
@@ -1835,6 +1963,8 @@ Options:
                       menu, and never installs anything in --yes or --dry-run mode
       --no-rescan     do not rescan the disks at startup
       --text          plain text prompts instead of whiptail
+  -v, --verbose       at startup also show every (read-only) command dskxp runs
+  -q, --quiet         do not show the startup overview
   -h, --help          this help
   -V, --version       show the version
 
@@ -1865,6 +1995,8 @@ parse_args() {
             -c|--check)    ACTION=check ;;
             --force)       OPT_FORCE=1 ;;
             --install-missing) OPT_INSTALL=1 ;;
+            -v|--verbose)  OPT_VERBOSE=1 ;;
+            -q|--quiet)    OPT_QUIET=1 ;;
             -s|--size)     OPT_SIZE=${2:?--size needs a value}; shift ;;
             -u|--use)      OPT_USE+=("${2:?--use needs a value}"); shift ;;
             --fs)          OPT_FS=${2:?--fs needs a value}; shift ;;
@@ -1882,11 +2014,16 @@ parse_args() {
     done
 }
 
-check_requirements() {
-    local c missing=() hint
+missing_basics() {
+    local c
     for c in sfdisk partx blkid findmnt awk pvs vgs lvs pvresize lvextend; do
-        have "$c" || missing+=("$c")
+        have "$c" || echo "$c"
     done
+}
+
+check_requirements() {
+    local missing=() hint
+    mapfile -t missing < <(missing_basics)
     (( ${#missing[@]} )) || return 0
     # interactive start (no action given) may ask; command line mode only with --install-missing
     if [[ -z $ACTION ]] || (( OPT_INSTALL )); then
@@ -1912,21 +2049,38 @@ That works fine; whiptail only makes it look nicer." whiptail || true
 main() {
     parse_args "$@"
     (( EUID == 0 )) || die "must be run as root (try: sudo $0)"
-    check_requirements
+    [[ $ACTION == rescan ]] && P_TOTAL=2
+    progress_start
+    step "Checking required tools"
+    if [[ -z $(missing_basics) ]]; then
+        step_done "ok (util-linux, lvm2$(have whiptail && printf ', whiptail'))"
+    else
+        p_break
+        check_requirements
+        step_done "ok after installing"
+    fi
     if command -v flock >/dev/null; then
         exec 9>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
         flock -n 9 || die "another dskxp is already running"
     fi
-    (( OPT_RESCAN )) && rescan_disks
+    step "Rescanning disks"
+    if (( OPT_RESCAN )); then
+        rescan_disks
+        if [[ -n $RESCAN_REPORT ]]; then step_done "changes found"; else step_done "no changes"; fi
+    else
+        step_done "skipped (--no-rescan)"
+    fi
+    [[ $ACTION == rescan ]] || discover
+    progress_end
     [[ -n $ACTION ]] && UI=text   # command line mode never uses whiptail
     case $ACTION in
         "")     interactive ;;
-        list)   discover; overview ;;
-        check)  discover; check_report ;;
+        list)   overview ;;
+        check)  check_report ;;
         rescan) printf '%s\n' "${RESCAN_REPORT:-No size changes or new disks detected.}" ;;
-        extend) discover; cli_extend ;;
-        create) discover; cli_create ;;
-        add)    discover; cli_add ;;
+        extend) cli_extend ;;
+        create) cli_create ;;
+        add)    cli_add ;;
     esac
 }
 

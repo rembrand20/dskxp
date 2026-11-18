@@ -17,6 +17,40 @@ sudo dskxp
    estimated chance of success. Nothing changes until you confirm.
 6. Afterwards it **verifies** every change and reports `OK` / `FAIL` per item.
 
+## What you see when it starts
+
+dskxp first shows what it is doing, step by step (on stderr, so the output of
+`--list` and `--check` stays clean for scripts):
+
+```
+dskxp 0.2.0 - starting
+[1/6] Checking required tools .............. ok (util-linux, lvm2, whiptail)
+[2/6] Rescanning disks
+      SCSI hosts scanned for new disks: host0 host1 host2
+      disks asked for their current size: sda sdb
+      /dev/sda: GREW 20.0G -> 60.0G
+      => changes found
+[3/6] Reading partition tables
+      /dev/sda            60.0G  gpt, 3 partition(s)
+      => 1 disk(s)
+[4/6] Reading LVM .......................... 1 VG, 1 PV, 2 LV
+[5/6] Checking filesystems and mounts
+      rl/root                     17.0G  xfs on / (92% used)
+      rl/swap                      2.0G  swap on [SWAP]
+      => 1 filesystem(s)
+[6/6] Looking for free space
+         ~40.0G  grow /dev/sda3 (volume group rl)
+      => 1 source(s), ~40.0G
+Done in 1.2s
+Press Enter to open the menu...
+```
+
+- `-v` / `--verbose` also shows every read-only command it runs
+  (`sfdisk -d`, `pvs`, `blkid`, the rescan writes in `/sys`, ...).
+- `-q` / `--quiet` hides the overview.
+- Every step is also written to `/var/log/dskxp.log`.
+- While a plan runs you see every step with its exact command and output.
+
 ## What it can do
 
 | Situation | What dskxp does |

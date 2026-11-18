@@ -143,6 +143,19 @@ check "list shows empty disk" grep -q "disk:$L" <<<"$out"
 check "dskxpt4 now has 2 PVs" test "$(vg_pvs dskxpt4)" = 2
 
 # ---------------------------------------------------------------------------
+echo "== Startup overview"
+"$DSKXP" --list --no-rescan >"$WORK/out" 2>"$WORK/err"
+check "startup steps are shown on stderr" grep -q '^\[6/6\] Looking for free space' "$WORK/err"
+check "startup shows the result of each step" grep -q '^\[4/6\] Reading LVM .* VG, .* PV, .* LV' "$WORK/err"
+check "stdout of --list stays clean" bash -c "! grep -q '^\[[0-9]/6\]' '$WORK/out' && grep -q '^DISKS' '$WORK/out'"
+"$DSKXP" --list --no-rescan -q >"$WORK/out" 2>"$WORK/err"
+check "-q hides the startup overview" test ! -s "$WORK/err"
+"$DSKXP" --list -v >/dev/null 2>"$WORK/err"
+check "-v shows the commands that are run" grep -q '\$ sfdisk -d /dev/' "$WORK/err"
+check "-v shows the LVM queries" grep -q '\$ pvs -o' "$WORK/err"
+check "startup is written to the log" grep -q 'step 6/6: Looking for free space' "$DSKXP_LOG"
+
+# ---------------------------------------------------------------------------
 echo "== Safety"
 mkloop used 100M
 mkfs.ext4 -q "$L"
