@@ -26,6 +26,7 @@ GUID_LVM=E6D6D379-F507-44C2-A23C-238F2A3DF928
 OPT_DRY_RUN=0
 OPT_YES=0
 OPT_FORCE=0
+OPT_INSTALL=0
 OPT_RESCAN=1
 OPT_UI=auto
 OPT_SIZE=all
@@ -868,17 +869,109 @@ plan_text() {
 }
 
 # --------------------------------------------------------------------------
+# missing tools: which package provides them and how to install it
+# --------------------------------------------------------------------------
+
+os_family() {
+    local ids
+    if [[ -n ${DSKXP_OS_FAMILY:-} ]]; then echo "$DSKXP_OS_FAMILY"; return; fi
+    # shellcheck disable=SC1091
+    ids=$( . /etc/os-release 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}" )
+    case " $ids " in
+        *" debian "*|*" ubuntu "*)                                          echo debian ;;
+        *" rhel "*|*" fedora "*|*" centos "*|*" rocky "*|*" almalinux "*)    echo rhel ;;
+        *" suse "*|*" opensuse "*|*" sles "*)                               echo suse ;;
+        *" arch "*)                                                         echo arch ;;
+        *" alpine "*)                                                       echo alpine ;;
+        *)                                                                  echo unknown ;;
+    esac
+}
+
+pkg_for() {   # pkg_for TOOL FAMILY -> package name
+    case $1 in
+        pvs|vgs|lvs|pvresize|pvcreate|vgextend|vgcreate|lvextend|lvcreate|vgck) echo lvm2 ;;
+        sfdisk)   case $2 in debian) echo fdisk ;; *) echo util-linux ;; esac ;;
+        swapon|swapoff|mount)
+                  case $2 in debian) echo mount ;; *) echo util-linux ;; esac ;;
+        partx|blkid|findmnt|blockdev|flock|mkswap) echo util-linux ;;
+        resize2fs|e2fsck|dumpe2fs|mkfs.ext4) echo e2fsprogs ;;
+        xfs_growfs|mkfs.xfs) echo xfsprogs ;;
+        btrfs|mkfs.btrfs)    echo btrfs-progs ;;
+        cryptsetup)          echo cryptsetup ;;
+        mdadm)               echo mdadm ;;
+        whiptail) case $2 in debian) echo whiptail ;; arch) echo libnewt ;; *) echo newt ;; esac ;;
+        awk)                 echo gawk ;;
+        *) return 1 ;;
+    esac
+}
+
+# install_hint TOOL... -> the command that installs them (fails if unknown)
+install_hint() {
+    local fam t p pkgs=""
+    fam=$(os_family)
+    [[ $fam == unknown ]] && return 1
+    for t in "$@"; do
+        p=$(pkg_for "$t" "$fam") || return 1
+        [[ " $pkgs " == *" $p "* ]] || pkgs+="${pkgs:+ }$p"
+    done
+    case $fam in
+        debian) echo "apt-get install -y $pkgs || { apt-get update && apt-get install -y $pkgs; }" ;;
+        rhel)   if have yum && ! have dnf; then echo "yum install -y $pkgs"; else echo "dnf install -y $pkgs"; fi ;;
+        suse)   echo "zypper --non-interactive install $pkgs" ;;
+        arch)   echo "pacman -S --noconfirm --needed $pkgs" ;;
+        alpine) echo "apk add $pkgs" ;;
+    esac
+}
+
+# offer_install REASON TOOL... -> 0 when all tools are available afterwards.
+# Never installs in a dry run, and in scripts (--yes / no terminal) only with
+# --install-missing.
+offer_install() {
+    local reason=$1 cmd rc t still=()
+    shift
+    cmd=$(install_hint "$@") || return 1
+    (( OPT_DRY_RUN )) && return 1
+    if (( ! OPT_INSTALL )); then
+        (( OPT_YES )) && return 1
+        [[ -t 0 ]] || return 1
+        ui_yesno "Install missing tools?" "$reason
+Missing: $*
+
+Install them now with:
+  $cmd" defaultno || return 1
+    fi
+    [[ $UI == whiptail ]] && clear
+    printf '\n==> Installing missing tools: %s\n    # %s\n' "$*" "$cmd"
+    log "INSTALL: $cmd"
+    if [[ -w $LOG_FILE || ( ! -e $LOG_FILE && -w $(dirname "$LOG_FILE") ) ]]; then
+        bash -c "$cmd" 2>&1 | tee -a "$LOG_FILE"; rc=${PIPESTATUS[0]}
+    else
+        bash -c "$cmd"; rc=$?
+    fi
+    hash -r
+    for t in "$@"; do have "$t" || still+=("$t"); done
+    if (( rc != 0 || ${#still[@]} > 0 )); then
+        printf '!!! Installation did not succeed (exit code %d)%s\n' "$rc" "${still[*]:+, still missing: ${still[*]}}"
+        log "INSTALL FAILED rc=$rc missing=${still[*]}"
+        return 1
+    fi
+    printf 'Installed.\n'
+    log "INSTALL OK"
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # preflight check: is it likely that this plan works?
 #   every check gives OK / WARN (costs a fixed percentage) / FAIL (blocks).
 #   The resulting percentage is an estimate, not a mathematical probability.
 # --------------------------------------------------------------------------
 
 PF_SCORE=100 PF_FAILS=0 PF_WARNS=0
-PF_LINES=()
+PF_LINES=() PF_MISSING=()
 PF_TOOLS="sfdisk partx pvresize pvcreate vgextend vgcreate lvextend lvcreate resize2fs e2fsck xfs_growfs btrfs cryptsetup mdadm mkswap swapon swapoff mkfs.ext4 mkfs.xfs mkfs.btrfs blkid mount"
 
 have()    { command -v "$1" >/dev/null 2>&1; }
-pf_reset(){ PF_SCORE=100 PF_FAILS=0 PF_WARNS=0; PF_LINES=(); }
+pf_reset(){ PF_SCORE=100 PF_FAILS=0 PF_WARNS=0; PF_LINES=(); PF_MISSING=(); }
 pf_ok()   { PF_LINES+=("[ OK ] $1"); }
 pf_info() { PF_LINES+=("[INFO] $1"); }
 pf_fail() { PF_FAILS=$(( PF_FAILS + 1 )); PF_LINES+=("[FAIL] $1"); }
@@ -900,7 +993,13 @@ preflight() {
         have "$t" || missing+=("$t")
     done
     if (( ${#missing[@]} )); then
-        pf_fail "missing tools needed by this plan: ${missing[*]}"
+        PF_MISSING=("${missing[@]}")
+        local hint
+        if hint=$(install_hint "${missing[@]}"); then
+            pf_fail "missing tools needed by this plan: ${missing[*]} - install with: $hint"
+        else
+            pf_fail "missing tools needed by this plan: ${missing[*]} - install the packages that provide them"
+        fi
     else
         pf_ok "all tools needed by this plan are installed"
     fi
@@ -1039,14 +1138,10 @@ pf_target_lv() {
 }
 
 pf_distro() {
-    local ids
-    # shellcheck disable=SC1091
-    ids=$( . /etc/os-release 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}" )
-    case " $ids " in
-        *" debian "*|*" ubuntu "*) pf_ok "distribution family is tested (Debian/Ubuntu)" ;;
-        *" rhel "*|*" fedora "*|*" centos "*|*" rocky "*|*" almalinux "*)
-            pf_warn 5 "RHEL-family distributions are supported but not yet covered by the automated tests" ;;
-        *) pf_warn 10 "this distribution ($ids) is not tested" ;;
+    case $(os_family) in
+        debian) pf_ok "distribution family is tested (Debian/Ubuntu)" ;;
+        rhel)   pf_warn 5 "RHEL-family distributions are supported but not yet covered by the automated tests" ;;
+        *)      pf_warn 10 "this distribution is not tested" ;;
     esac
 }
 
@@ -1199,6 +1294,16 @@ execute_plan() {
 
 $pftxt"
         return 0
+    fi
+    if (( ${#PF_MISSING[@]} > 0 )); then
+        (( OPT_YES || OPT_INSTALL )) || ui_text "Plan" "$txt
+
+$pftxt"
+        if offer_install "This plan needs tools that are not installed." "${PF_MISSING[@]}"; then
+            preflight
+            pftxt=$(preflight_text)
+            score=$(pf_result)
+        fi
     fi
     if (( PF_FAILS > 0 && ! OPT_FORCE )); then
         ui_text "Preflight check failed" "$txt
@@ -1591,6 +1696,7 @@ on some older systems a reboot is needed.}"
 }
 
 interactive() {
+    offer_whiptail
     ui_init
     discover
     local head="Disks were rescanned. ${RESCAN_REPORT:+Changes:
@@ -1724,6 +1830,9 @@ Options:
   -n, --dry-run       only show the plan and its preflight check, change nothing
   -y, --yes           do not ask for confirmation
       --force         run even when the preflight check fails (not recommended)
+      --install-missing  install missing tools without asking (apt/dnf/yum/
+                      zypper/pacman/apk). Without it dskxp asks first in the
+                      menu, and never installs anything in --yes or --dry-run mode
       --no-rescan     do not rescan the disks at startup
       --text          plain text prompts instead of whiptail
   -h, --help          this help
@@ -1755,6 +1864,7 @@ parse_args() {
             --rescan)      ACTION=rescan ;;
             -c|--check)    ACTION=check ;;
             --force)       OPT_FORCE=1 ;;
+            --install-missing) OPT_INSTALL=1 ;;
             -s|--size)     OPT_SIZE=${2:?--size needs a value}; shift ;;
             -u|--use)      OPT_USE+=("${2:?--use needs a value}"); shift ;;
             --fs)          OPT_FS=${2:?--fs needs a value}; shift ;;
@@ -1773,15 +1883,30 @@ parse_args() {
 }
 
 check_requirements() {
-    local c missing=()
+    local c missing=() hint
     for c in sfdisk partx blkid findmnt awk pvs vgs lvs pvresize lvextend; do
-        command -v "$c" >/dev/null || missing+=("$c")
+        have "$c" || missing+=("$c")
     done
-    if (( ${#missing[@]} )); then
-        die "missing commands: ${missing[*]}
-  Debian/Ubuntu: apt install lvm2 util-linux fdisk
-  RHEL/Rocky/Alma: dnf install lvm2 util-linux"
+    (( ${#missing[@]} )) || return 0
+    # interactive start (no action given) may ask; command line mode only with --install-missing
+    if [[ -z $ACTION ]] || (( OPT_INSTALL )); then
+        offer_install "dskxp needs these tools to run." "${missing[@]}" && return 0
     fi
+    if hint=$(install_hint "${missing[@]}"); then
+        die "missing commands: ${missing[*]}
+  install with: $hint
+  (or run dskxp with --install-missing)"
+    fi
+    die "missing commands: ${missing[*]}
+  install the packages that provide them (lvm2, util-linux, fdisk)"
+}
+
+offer_whiptail() {
+    [[ $OPT_UI == text || ! -t 0 || ! -t 1 ]] && return 0
+    have whiptail && return 0
+    install_hint whiptail >/dev/null || return 0
+    offer_install "whiptail is not installed, so the menus are shown as plain text.
+That works fine; whiptail only makes it look nicer." whiptail || true
 }
 
 main() {

@@ -73,6 +73,24 @@ PREFLIGHT CHECK FOR EVERY LOGICAL VOLUME
   ubuntu-vg/swap                   ~40.0G      85%  the kernel still uses an older partition table ...
 ```
 
+## Missing tools
+
+dskxp knows which package provides every tool it uses, for Debian/Ubuntu
+(`apt-get`), RHEL/Rocky/Alma/Fedora (`dnf`/`yum`), SUSE (`zypper`), Arch
+(`pacman`) and Alpine (`apk`).
+
+| Situation | What happens |
+|---|---|
+| a basic tool (`sfdisk`, LVM, ...) is missing at startup | menu: asks to install it; command line: stops with the exact install command |
+| a tool needed for this plan is missing (`xfs_growfs`, `cryptsetup`, `mdadm`, ...) | preflight FAIL with the install command; the menu offers to install it and re-runs the preflight |
+| `whiptail` is missing | offers to install it; plain text menus work without it |
+| `--install-missing` | installs without asking (for scripts) |
+| `--yes` or `--dry-run` without `--install-missing` | never installs anything |
+
+```
+[FAIL] missing tools needed by this plan: xfs_growfs - install with: apt-get install -y xfsprogs || { apt-get update && apt-get install -y xfsprogs; }
+```
+
 ## Safety
 
 - Shows a plan with the exact commands first; `--dry-run` only shows it.
@@ -122,6 +140,7 @@ dskxp --extend vg0/var --use pv:/dev/sda3 --use disk:/dev/sdb
 dskxp --create data-vg/backup --use /dev/sdb --fs xfs --mount /backup --yes
 dskxp --add vg0 --use free:/dev/sda:1              # only add space to the VG
 dskxp --rescan                                     # only rescan the disks
+dskxp --extend vg0/data --yes --install-missing    # install missing tools first
 ```
 
 `--use` takes an ID from `--list` (`pv:/dev/sda3`, `disk:/dev/sdb`,

@@ -255,6 +255,34 @@ check "size close to the estimate costs 10%" test "$out" = "fails=0 score=90"
 check "verification detects a wrong size" bash -c "source '$DSKXP'; PLAN_VERIFY=(); add_verify part sda 999999999999999 '' 'x'; ! verify_plan"
 check "verification detects a missing LV" bash -c "source '$DSKXP'; PLAN_VERIFY=(); add_verify exists nosuchvg/nosuchlv '' '' 'x'; ! verify_plan"
 
+echo "== Missing tools (unit tests with a fake package manager)"
+hint() { DSKXP_OS_FAMILY=$1 bash -c "source '$DSKXP'; have() { false; }; install_hint ${*:2}" 2>/dev/null; }
+check "debian: xfs_growfs -> apt-get install xfsprogs" grep -q '^apt-get install -y xfsprogs ' <<<"$(hint debian xfs_growfs)"
+check "debian: sfdisk -> fdisk, whiptail -> whiptail" grep -q 'install -y fdisk whiptail ' <<<"$(hint debian sfdisk whiptail)"
+check "rhel: whiptail -> dnf install newt" test "$(hint rhel whiptail)" = "dnf install -y newt"
+check "suse: lvm tools -> one lvm2 package" test "$(hint suse pvs lvextend)" = "zypper --non-interactive install lvm2"
+check "unknown distribution: no hint" bash -c "! DSKXP_OS_FAMILY=unknown bash -c \"source '$DSKXP'; install_hint mdadm\" >/dev/null 2>&1"
+check "preflight names the package to install" bash -c "source '$DSKXP'; export DSKXP_OS_FAMILY=debian; have() { [[ \$1 != mdadm ]]; }; plan_reset; add_step x 'mdadm --grow /dev/md0 --size=max'; preflight; preflight_text | grep -q 'install with: apt-get install -y mdadm'"
+
+FAKE=$WORK/fakebin; mkdir -p "$FAKE"
+cat >"$FAKE/apt-get" <<EOF
+#!/bin/sh
+echo "\$*" >>"$FAKE/apt-get.calls"
+printf '#!/bin/sh\nexit 0\n' >"$FAKE/xfs_growfs"; chmod +x "$FAKE/xfs_growfs"
+EOF
+chmod +x "$FAKE/apt-get"
+offer() {   # offer OPTS -> runs offer_install for xfs_growfs with the fake apt-get
+    rm -f "$FAKE/xfs_growfs" "$FAKE/apt-get.calls"
+    PATH="$FAKE:$PATH" DSKXP_OS_FAMILY=debian bash -c "source '$DSKXP'; have() { [[ \$1 == xfs_growfs ]] && { [[ -x '$FAKE/xfs_growfs' ]]; return; }; command -v \"\$1\" >/dev/null; }; $1; offer_install test xfs_growfs" </dev/null >/dev/null 2>&1
+}
+offer "OPT_YES=1"
+check "--yes alone never installs" test ! -e "$FAKE/apt-get.calls"
+offer "OPT_DRY_RUN=1; OPT_INSTALL=1"
+check "--dry-run never installs" test ! -e "$FAKE/apt-get.calls"
+offer "OPT_INSTALL=1; OPT_YES=1"
+check "--install-missing installs the right package" grep -q '^install -y xfsprogs' "$FAKE/apt-get.calls"
+check "--install-missing: tool available afterwards" test -x "$FAKE/xfs_growfs"
+
 echo "== Size parsing"
 psize() { bash -c "source '$DSKXP'; parse_size '$1' 1073741824"; }
 check "10G"  test "$(psize 10G)" = 10737418240
