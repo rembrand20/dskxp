@@ -1,5 +1,7 @@
 # dskxp
 
+*A product of Rz//Sense*
+
 Grow LVM storage on Linux after you enlarged a disk (Proxmox, VMware, Hyper-V,
 KVM, ...) or added a new one — from a simple menu in the shell.
 
@@ -23,7 +25,8 @@ dskxp first shows what it is doing, step by step (on stderr, so the output of
 `--list` and `--check` stays clean for scripts):
 
 ```
-dskxp 0.2.0 - starting
+dskxp 0.2.1 - A product of Rz//Sense
+Starting
 [1/6] Checking required tools .............. ok (util-linux, lvm2, whiptail)
 [2/6] Rescanning disks
       SCSI hosts scanned for new disks: host0 host1 host2

@@ -11,8 +11,9 @@
 set -o pipefail
 set -u
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 PROG=dskxp
+BRAND="A product of Rz//Sense"
 
 LOG_FILE=${DSKXP_LOG:-/var/log/dskxp.log}
 BACKUP_DIR=${DSKXP_BACKUP_DIR:-/var/backups/dskxp}
@@ -164,7 +165,8 @@ vshow() { (( OPT_VERBOSE )) && p_detail "\$ $*"; return 0; }   # show a read-onl
 progress_start() {
     (( OPT_QUIET )) && return 0
     PROGRESS=1 P_N=0 P_T0=$(now_ms)
-    printf 'dskxp %s - starting%s\n' "$VERSION" "$( (( OPT_VERBOSE )) && printf ' (verbose: showing every command)')" >&2
+    printf 'dskxp %s - %s\n' "$VERSION" "$BRAND" >&2
+    printf 'Starting%s\n' "$( (( OPT_VERBOSE )) && printf ' (verbose: showing every command)')" >&2
 }
 
 progress_end() {
@@ -1735,7 +1737,7 @@ ui_lines() { local t=$1; local n; n=$(printf '%s\n' "$t" | wc -l); echo "$n"; }
 ui_text() {   # long, scrollable text
     if [[ $UI == whiptail ]]; then
         ui_dims
-        whiptail --title "$1" --scrolltext --msgbox "$2" "$UI_H" "$UI_W"
+        whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$1" --scrolltext --msgbox "$2" "$UI_H" "$UI_W"
     else
         printf '\n== %s ==\n%s\n' "$1" "$2"
         [[ -t 0 ]] && read -r -p "Press Enter to continue... " _
@@ -1746,7 +1748,7 @@ ui_text() {   # long, scrollable text
 ui_msg() {
     if [[ $UI == whiptail ]]; then
         ui_dims
-        whiptail --title "$1" --msgbox "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
+        whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$1" --msgbox "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
     else
         printf '\n== %s ==\n%s\n' "$1" "$2"
     fi
@@ -1757,7 +1759,7 @@ ui_yesno() {   # ui_yesno TITLE TEXT [defaultno]
     local a
     if [[ $UI == whiptail ]]; then
         ui_dims
-        whiptail --title "$1" ${3:+--defaultno} --yesno "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
+        whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$1" ${3:+--defaultno} --yesno "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
         return
     fi
     printf '\n== %s ==\n%s\n' "$1" "$2"
@@ -1772,7 +1774,7 @@ ui_input() {   # ui_input TITLE TEXT DEFAULT
     local a
     if [[ $UI == whiptail ]]; then
         ui_dims
-        UI_REPLY=$(whiptail --title "$1" --inputbox "$2" $(( $(ui_lines "$2") + 9 )) "$UI_W" "$3" 3>&1 1>&2 2>&3) || return 1
+        UI_REPLY=$(whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$1" --inputbox "$2" $(( $(ui_lines "$2") + 9 )) "$UI_W" "$3" 3>&1 1>&2 2>&3) || return 1
         return 0
     fi
     printf '\n== %s ==\n%s\n' "$1" "$2"
@@ -1790,7 +1792,7 @@ ui_menu() {   # ui_menu TITLE TEXT TAG ITEM ...
         ui_dims
         lh=$(( UI_H - $(ui_lines "$text") - 8 )); (( lh > ${#tags[@]} )) && lh=${#tags[@]}; (( lh < 3 )) && lh=3
         for i in "${!tags[@]}"; do args+=("${tags[i]}" "${items[i]}"); done
-        UI_REPLY=$(whiptail --title "$title" --notags --menu "$text" \
+        UI_REPLY=$(whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$title" --notags --menu "$text" \
             $(( lh + $(ui_lines "$text") + 8 )) "$UI_W" "$lh" "${args[@]}" 3>&1 1>&2 2>&3) || return 1
         return 0
     fi
@@ -1813,7 +1815,7 @@ ui_checklist() {   # ui_checklist TITLE TEXT TAG ITEM ON|OFF ...  -> UI_REPLY ne
         ui_dims
         lh=$(( UI_H - $(ui_lines "$text") - 8 )); (( lh > ${#tags[@]} )) && lh=${#tags[@]}; (( lh < 3 )) && lh=3
         for i in "${!tags[@]}"; do args+=("${tags[i]}" "${items[i]}" "${states[i]}"); done
-        UI_REPLY=$(whiptail --title "$title" --notags --separate-output --checklist "$text" \
+        UI_REPLY=$(whiptail --backtitle "dskxp $VERSION - $BRAND" --title "$title" --notags --separate-output --checklist "$text" \
             $(( lh + $(ui_lines "$text") + 8 )) "$UI_W" "$lh" "${args[@]}" 3>&1 1>&2 2>&3) || return 1
         return 0
     fi
@@ -2194,6 +2196,7 @@ cli_add() {
 usage() {
     cat <<EOF
 dskxp $VERSION - grow LVM storage after enlarging or adding a disk
+$BRAND
 
 Usage:
   dskxp                         interactive menu (whiptail, or plain text)
@@ -2268,7 +2271,7 @@ parse_args() {
             --no-rescan)   OPT_RESCAN=0 ;;
             --text)        OPT_UI=text ;;
             -h|--help)     usage; exit 0 ;;
-            -V|--version)  echo "dskxp $VERSION"; exit 0 ;;
+            -V|--version)  echo "dskxp $VERSION - $BRAND"; exit 0 ;;
             *)             die "unknown option '$1' (see --help)" ;;
         esac
         shift
