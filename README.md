@@ -13,7 +13,9 @@ sudo dskxp
    points and usage.
 4. Pick the volume (mount point) that needs space, where the space should come
    from and how much (`20G`, `50%`, `all`).
-5. dskxp shows **every command it will run**. Nothing changes until you confirm.
+5. dskxp shows **every command it will run** plus a **preflight check** with an
+   estimated chance of success. Nothing changes until you confirm.
+6. Afterwards it **verifies** every change and reports `OK` / `FAIL` per item.
 
 ## What it can do
 
@@ -29,6 +31,47 @@ sudo dskxp
 | Extend a logical volume | `lvextend` + grow the filesystem: ext2/3/4 (`resize2fs`), XFS (`xfs_growfs`), btrfs, swap (keeps its UUID), LUKS on top of the LV |
 | New logical volume | `lvcreate` → `mkfs` (ext4/xfs/btrfs/swap) → mount point → `/etc/fstab` (by UUID) |
 | Thin pools (e.g. Proxmox `pve/data`) | `lvextend` of the pool |
+
+## Preflight check, verification and `--check`
+
+**Before** running a plan, dskxp checks:
+
+| Check | Result if it fails |
+|---|---|
+| every tool the plan needs is installed (`xfs_growfs`, `cryptsetup`, ...) | FAIL |
+| `sfdisk` supports online partition resizing (util-linux 2.29+) | FAIL |
+| the volume group is complete (no missing PV) and `vgck` is happy | FAIL |
+| partition tables are valid (`sfdisk -V`) | FAIL |
+| the target filesystem is not mounted read-only | FAIL |
+| enough free RAM to turn swap off temporarily | FAIL |
+| kernel and on-disk partition table agree (else: reboot first) | WARN −15% |
+| ext filesystem has no recorded errors / is clean | WARN −25% / −15% |
+| requested size is not within 3% of the estimated maximum | WARN −10% |
+| scenario not covered by the automated tests (LUKS −10%, mdraid −15%, btrfs −10%) | WARN |
+| `/etc/fstab` has no existing problems (when it will be edited) | WARN −10% |
+| distribution family tested (RHEL family −5%, others −10%) | WARN |
+
+The **chance of success** is 100% minus the penalty of each warning. It is an
+honest estimate, not a mathematical probability. A FAIL blocks the run
+(`--force` overrides it, not recommended).
+
+**After** the run, every change is verified: partition sizes, the GPT backup
+header position, PV size, PV membership of the VG, LV size, filesystem size
+(`df`, it must grow along with the volume), swap UUID and state, the new
+filesystem type, the mount and the `/etc/fstab` entry. dskxp exits with
+status 1 if any check fails, so scripts and Ansible notice it.
+
+**`dskxp --check`** is a health report for the whole server: for every logical
+volume it shows how much space can be added and the estimated chance of
+success — without changing anything. `--dry-run` instead shows the full plan
+and preflight for one specific action.
+
+```
+PREFLIGHT CHECK FOR EVERY LOGICAL VOLUME
+  LV                                EXTRA   CHANCE  REMARKS
+  ubuntu-vg/ubuntu-lv              ~40.0G     100%  all checks OK
+  ubuntu-vg/swap                   ~40.0G      85%  the kernel still uses an older partition table ...
+```
 
 ## Safety
 
@@ -72,6 +115,7 @@ well (util-linux 2.32+).
 
 ```
 dskxp --list                                       # overview + source IDs
+dskxp --check                                      # chance of success per volume
 dskxp --extend ubuntu-vg/ubuntu-lv --dry-run       # show what would happen
 dskxp --extend rl/root --size 20G --yes            # grow / by 20G
 dskxp --extend vg0/var --use pv:/dev/sda3 --use disk:/dev/sdb

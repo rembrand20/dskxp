@@ -72,6 +72,8 @@ check "dry-run changed nothing" test "$(pv_bytes "${L}p2")" = "$before"
 "$DSKXP" --add dskxpt1 --yes >"$WORK/run" 2>&1 || cat "$WORK/run"
 after=$(pv_bytes "${L}p2")
 check "PV grew by more than 190MiB ($before -> $after)" test $(( after - before )) -gt $(( 190 * MB ))
+check "dry-run shows the preflight check with a percentage" grep -q "estimated chance of success [0-9]*%" "$WORK/plan"
+check "verification after the run passed (GPT header, partition, PV)" grep -q "Result: all 3 checks passed" "$WORK/run"
 check "mounted partition still mounted" findmnt -n "$WORK/m1" >/dev/null
 check "partition table backup written" compgen -G "$WORK/backup/$(basename "$L")-*.sfdisk" >/dev/null
 check "sfdisk sees no GPT problems" bash -c "! sfdisk -V $L 2>&1 | grep -qi 'not on the end'"
@@ -197,6 +199,20 @@ else
     findmnt -n "$WORK/new" >/dev/null && MOUNTS=("$WORK/new" "${MOUNTS[@]}")
     check "new LV created and mounted" test "$(findmnt -n -o SOURCE "$WORK/new" 2>/dev/null)" = /dev/mapper/dskxpt6-new
     check "mount point in use is rejected" bash -c "! '$DSKXP' --create dskxpt6/x --size 8M --mount '$WORK/new' --dry-run --no-rescan >/dev/null 2>&1"
+    check "new LV run verified (size, filesystem, mount)" grep -q "Result: all 3 checks passed" "$WORK/run"
+
+    # --check lists the volumes with a percentage
+    out=$("$DSKXP" --check --no-rescan 2>&1)
+    check "--check lists dskxpt6/data with a chance" grep -qE "dskxpt6/data .*[0-9]+%" <<<"$out"
+
+    # read-only mounted filesystem: preflight must block, nothing may change
+    lvcreate -q -y -L 32M -n ro dskxpt6 >/dev/null
+    mkfs.ext4 -q /dev/dskxpt6/ro
+    mkdir -p "$WORK/ro"; mount -o ro /dev/dskxpt6/ro "$WORK/ro" && MOUNTS=("$WORK/ro" "${MOUNTS[@]}")
+    if "$DSKXP" --extend dskxpt6/ro --size 8M --yes --no-rescan >"$WORK/run" 2>&1; then rc=0; else rc=1; fi
+    check "read-only mount: run refused" test "$rc" = 1
+    check "read-only mount: preflight says BLOCKED" grep -q "BLOCKED" "$WORK/run"
+    check "read-only mount: LV size unchanged" test "$(lvs --noheadings --units b --nosuffix -o lv_size dskxpt6/ro | tr -d ' ')" = $(( 32 * MB ))
 fi
 
 # ---------------------------------------------------------------------------
@@ -207,7 +223,8 @@ plan_case() {   # plan_case NAME EXPECTED_REGEX -- bash code
     out=$(bash -c "source '$DSKXP'; TS=test; $*; plan_text" 2>&1)
     if grep -qE -- "$expect" <<<"$out"; then ok "$name"; else bad "$name"; printf '%s\n' "$out" | sed 's/^/       /'; fi
 }
-setup='VG_EXT[vg]=4194304; VG_FREE[vg]=10737418240; plan_reset'
+# shellcheck disable=SC2016  # expanded later, inside the sourced script
+setup='VG_EXT[vg]=4194304; VG_FREE[vg]=10737418240; for k in vg/root vg/var vg/data vg/home vg/swap pve/data; do LV_SIZE[$k]=1073741824; done; plan_reset'
 plan_case "ext4 mounted: lvextend + resize2fs" 'lvextend -L \+5120m vg/root.*resize2fs /dev/vg/root' -- \
     "$setup; LV_ATTR[vg/root]=-wi-ao----; LV_FS[vg/root]=ext4; LV_MNT[vg/root]=/; LV_FSDEV[vg/root]=/dev/vg/root; LV_CRYPT[vg/root]=; plan_extend_lv vg/root 5368709120; plan_text | tr '\n' ' '; exit"
 plan_case "xfs mounted: xfs_growfs on mount point" 'lvextend -l \+100%FREE vg/var.*xfs_growfs /var' -- \
@@ -224,6 +241,19 @@ plan_case "create xfs LV with fstab entry" "lvcreate -y -L 2048m -n backup vg.*m
     "$setup; plan_create_lv vg backup 2147483648 xfs /backup 1; plan_text | tr '\n' ' '; exit"
 plan_case "size is rounded down to whole extents" 'lvextend -L \+1024m vg/root' -- \
     "$setup; LV_ATTR[vg/root]=-wi-ao----; LV_FS[vg/root]=ext4; LV_MNT[vg/root]=/; LV_FSDEV[vg/root]=/dev/vg/root; LV_CRYPT[vg/root]=; plan_extend_lv vg/root 1075838976; plan_text | tr '\n' ' '; exit"
+
+echo "== Preflight scoring and verification (unit tests)"
+pf() { bash -c "source '$DSKXP'; plan_reset; $1; preflight; echo \"fails=\$PF_FAILS score=\$(pf_result)\"" 2>/dev/null | tail -n1; }
+out=$(pf "have() { [[ \$1 != xfs_growfs ]]; }; add_step x 'xfs_growfs /srv'")
+check "missing tool blocks the run (score 0)" test "$out" = "fails=1 score=0"
+out=$(pf "pf_distro() { pf_ok distro; }; add_step x 'cryptsetup resize foo'")
+check "LUKS step costs 10% (score 90)" test "$out" = "fails=0 score=90"
+out=$(pf "pf_distro() { pf_ok distro; }; add_step x 'mdadm --grow /dev/md0 --size=max'; add_step y 'cryptsetup resize foo'")
+check "warnings add up (mdadm + LUKS: score 75)" test "$out" = "fails=0 score=75"
+out=$(pf "pf_distro() { pf_ok distro; }; PLAN_AMOUNT=1000; PLAN_AVAIL=1010; PLAN_NSRC=1; add_step x 'lvextend -L +1m vg/lv'")
+check "size close to the estimate costs 10%" test "$out" = "fails=0 score=90"
+check "verification detects a wrong size" bash -c "source '$DSKXP'; PLAN_VERIFY=(); add_verify part sda 999999999999999 '' 'x'; ! verify_plan"
+check "verification detects a missing LV" bash -c "source '$DSKXP'; PLAN_VERIFY=(); add_verify exists nosuchvg/nosuchlv '' '' 'x'; ! verify_plan"
 
 echo "== Size parsing"
 psize() { bash -c "source '$DSKXP'; parse_size '$1' 1073741824"; }
