@@ -1,0 +1,1389 @@
+#!/usr/bin/env bash
+# dskxp - grow LVM storage after a disk was enlarged or a disk was added.
+#
+# Copyright (C) 2026 rembrand20
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Typical use: enlarge a virtual disk in Proxmox / VMware / Hyper-V (or add a
+# physical disk), run `sudo dskxp`, pick the logical volume that needs more
+# space and how much. dskxp shows the exact commands before it runs anything.
+
+set -o pipefail
+set -u
+
+VERSION="0.1.0"
+PROG=dskxp
+
+LOG_FILE=${DSKXP_LOG:-/var/log/dskxp.log}
+BACKUP_DIR=${DSKXP_BACKUP_DIR:-/var/backups/dskxp}
+LOCK_FILE=${DSKXP_LOCK:-/run/dskxp.lock}
+ALLOW_LOOP=${DSKXP_ALLOW_LOOP:-0}        # testing only: treat loop devices as disks
+
+MiB=1048576
+MIN_FREE=$((64 * MiB))                    # ignore unallocated areas smaller than this
+GUID_LVM=E6D6D379-F507-44C2-A23C-238F2A3DF928
+
+OPT_DRY_RUN=0
+OPT_YES=0
+OPT_RESCAN=1
+OPT_UI=auto
+OPT_SIZE=all
+OPT_FS=ext4
+OPT_MOUNT=""
+OPT_FSTAB=1
+OPT_USE=()
+ACTION=""
+TARGET=""
+
+TS=$(date +%Y%m%d-%H%M%S)
+export LVM_SUPPRESS_FD_WARNINGS=1
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+q()    { printf '%q' "$1"; }
+
+human() {
+    awk -v b="$1" 'BEGIN { split("B K M G T P", u, " "); i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%dB", b; else printf "%.1f%s", b, u[i] }'
+}
+
+# parse_size INPUT AVAILABLE -> bytes, or "all"
+parse_size() {
+    local s=${1// /} avail=$2 n u e
+    s=${s#+}
+    s=${s,,}
+    case $s in all|max|100%|"") echo all; return 0 ;; esac
+    if [[ $s =~ ^([0-9]+([.][0-9]+)?)%$ ]]; then
+        awk -v p="${BASH_REMATCH[1]}" -v a="$avail" 'BEGIN { printf "%.0f\n", a * p / 100 }'
+        return 0
+    fi
+    if [[ $s =~ ^([0-9]+([.][0-9]+)?)([kmgtp])(i?b)?$ ]]; then
+        n=${BASH_REMATCH[1]} u=${BASH_REMATCH[3]}
+        case $u in k) e=1 ;; m) e=2 ;; g) e=3 ;; t) e=4 ;; p) e=5 ;; esac
+        awk -v n="$n" -v e="$e" 'BEGIN { printf "%.0f\n", n * (1024 ^ e) }'
+        return 0
+    fi
+    return 1
+}
+
+kname_of()     { basename "$(readlink -f "$1")"; }
+is_partition() { [[ -e /sys/class/block/$1/partition ]]; }
+part_disk()    { basename "$(dirname "$(readlink -f "/sys/class/block/$1")")"; }
+part_num()     { cat "/sys/class/block/$1/partition"; }
+dev_bytes()    { echo $(( $(cat "/sys/class/block/$1/size" 2>/dev/null || echo 0) * 512 )); }
+has_holders()  { local h; for h in /sys/class/block/"$1"/holders/*; do [[ -e $h ]] && return 0; done; return 1; }
+has_signature(){ blkid -p "/dev/$1" >/dev/null 2>&1; }
+is_mounted()   { findmnt -n --source "/dev/$1" >/dev/null 2>&1 || grep -q "^/dev/$1 " /proc/swaps 2>/dev/null; }
+
+part_path() {   # part_path DISK NUM
+    if [[ $1 =~ [0-9]$ ]]; then echo "/dev/${1}p$2"; else echo "/dev/$1$2"; fi
+}
+
+list_disks() {
+    local p d
+    for p in /sys/block/*; do
+        d=${p##*/}
+        case $d in
+            loop*) [[ $ALLOW_LOOP == 1 && -e $p/loop/backing_file ]] || continue ;;
+            ram*|zram*|sr*|fd*|dm-*|md*|nbd*|mtdblock*|zd*|drbd*) continue ;;
+        esac
+        [[ $(cat "$p/size" 2>/dev/null || echo 0) -gt 0 ]] || continue
+        printf '%s\n' "$d"
+    done
+}
+
+# --------------------------------------------------------------------------
+# rescan
+# --------------------------------------------------------------------------
+
+declare -A RESCAN_INFO=()
+RESCAN_REPORT=""
+
+rescan_disks() {
+    local d f c
+    local -A before=()
+    for d in $(list_disks); do before[$d]=$(dev_bytes "$d"); done
+
+    for f in /sys/class/scsi_host/host*/scan; do
+        [[ -w $f ]] && echo '- - -' >"$f" 2>/dev/null
+    done
+    for d in $(list_disks); do
+        if [[ -w /sys/block/$d/device/rescan ]]; then
+            echo 1 >"/sys/block/$d/device/rescan" 2>/dev/null
+        elif [[ $d == loop* ]]; then
+            losetup -c "/dev/$d" 2>/dev/null
+        fi
+    done
+    for c in /sys/class/nvme/nvme*; do
+        [[ -w $c/rescan_controller ]] && echo 1 >"$c/rescan_controller" 2>/dev/null
+    done
+    command -v udevadm >/dev/null && udevadm settle 2>/dev/null
+
+    RESCAN_REPORT=""
+    for d in $(list_disks); do
+        local now; now=$(dev_bytes "$d")
+        if [[ -z ${before[$d]:-} ]]; then
+            RESCAN_INFO[$d]="new disk"
+            RESCAN_REPORT+="  /dev/$d: new disk, $(human "$now")"$'\n'
+        elif (( now != before[$d] )); then
+            RESCAN_INFO[$d]="was $(human "${before[$d]}")"
+            RESCAN_REPORT+="  /dev/$d: $(human "${before[$d]}") -> $(human "$now")"$'\n'
+        fi
+    done
+    log "rescan: ${RESCAN_REPORT:-no changes}"
+}
+
+# --------------------------------------------------------------------------
+# partition tables
+# --------------------------------------------------------------------------
+
+declare -A DISK_LOADED DISK_LABEL DISK_SS DISK_SECT DISK_FIRSTLBA DISK_LASTLBA DISK_PARTS
+declare -A PART_START PART_SIZE PART_TYPE
+
+load_disk() {
+    local d=$1 line dump num
+    [[ -n ${DISK_LOADED[$d]:-} ]] && return 0
+    DISK_LOADED[$d]=1
+    DISK_LABEL[$d]=none
+    DISK_SS[$d]=$(cat "/sys/block/$d/queue/logical_block_size" 2>/dev/null || echo 512)
+    DISK_FIRSTLBA[$d]=2048
+    DISK_LASTLBA[$d]=0
+    DISK_PARTS[$d]=""
+    dump=$(sfdisk -d "/dev/$d" 2>/dev/null) || dump=""
+    while IFS= read -r line; do
+        case $line in
+            label:*)       DISK_LABEL[$d]=${line##* } ;;
+            first-lba:*)   DISK_FIRSTLBA[$d]=${line##* } ;;
+            last-lba:*)    DISK_LASTLBA[$d]=${line##* } ;;
+            sector-size:*) DISK_SS[$d]=${line##* } ;;
+            /dev/*)
+                [[ $line =~ ^/dev/[^[:space:]]*[^0-9]([0-9]+)[[:space:]]*:[[:space:]]*start=[[:space:]]*([0-9]+),[[:space:]]*size=[[:space:]]*([0-9]+),[[:space:]]*type=([^,[:space:]]+) ]] || continue
+                num=${BASH_REMATCH[1]}
+                PART_START[$d:$num]=${BASH_REMATCH[2]}
+                PART_SIZE[$d:$num]=${BASH_REMATCH[3]}
+                PART_TYPE[$d:$num]=${BASH_REMATCH[4]}
+                DISK_PARTS[$d]+="$num "
+                ;;
+        esac
+    done <<<"$dump"
+    DISK_SECT[$d]=$(( $(cat "/sys/block/$d/size") * 512 / ${DISK_SS[$d]} ))
+}
+
+# exclusive end (in sectors) of the usable area of the disk
+disk_end() {
+    local d=$1 n=${DISK_SECT[$1]}
+    case ${DISK_LABEL[$d]} in
+        gpt) echo $(( n - 1 - 16384 / ${DISK_SS[$d]} )) ;;
+        dos) (( n > 4294967296 )) && n=4294967296; echo "$n" ;;
+        *)   echo "$n" ;;
+    esac
+}
+
+part_is_logical() { [[ ${DISK_LABEL[$1]} == dos ]] && (( $2 >= 5 )); }
+part_is_extended() { [[ ${DISK_LABEL[$1]} == dos ]] && [[ ${PART_TYPE[$1:$2],,} =~ ^(5|f|85)$ ]]; }
+
+ext_num() {
+    local n
+    for n in ${DISK_PARTS[$1]}; do part_is_extended "$1" "$n" && { echo "$n"; return 0; }; done
+    return 1
+}
+
+# exclusive end limit for a top-level partition that starts at sector $2
+top_limit() {
+    local d=$1 s=$2 n lim
+    lim=$(disk_end "$d")
+    for n in ${DISK_PARTS[$d]}; do
+        part_is_logical "$d" "$n" && continue
+        (( ${PART_START[$d:$n]} > s && ${PART_START[$d:$n]} < lim )) && lim=${PART_START[$d:$n]}
+    done
+    echo "$lim"
+}
+
+needs_relocate() {   # GPT backup header not at the (new) end of the disk
+    [[ ${DISK_LABEL[$1]} == gpt ]] && (( ${DISK_LASTLBA[$1]} + 1 < $(disk_end "$1") ))
+}
+
+# --------------------------------------------------------------------------
+# grow chains: what has to happen below a PV so it can grow
+#   results: NEWSIZE (bytes), CH_STEPS (desc<TAB>cmd lines), CH_NOTE, CH_DISKS
+# --------------------------------------------------------------------------
+
+declare -A COVERED=()
+CH_STEPS="" CH_NOTE="" CH_DISKS="" NEWSIZE=0
+
+ch_add() { CH_STEPS+="$1"$'\t'"$2"$'\n'; }
+
+grow_layer() {
+    local k=$1 uuid
+    if is_partition "$k"; then
+        grow_partition "$k"
+    elif [[ -d /sys/block/$k/md ]]; then
+        grow_md "$k"
+    elif [[ -d /sys/block/$k/dm ]]; then
+        uuid=$(cat "/sys/block/$k/dm/uuid" 2>/dev/null)
+        if [[ $uuid == CRYPT-* ]]; then
+            grow_crypt "$k"
+        else
+            NEWSIZE=$(dev_bytes "$k")
+            CH_NOTE+="device-mapper device $(cat "/sys/block/$k/dm/name" 2>/dev/null) cannot be grown automatically; "
+        fi
+    else
+        NEWSIZE=$(dev_bytes "$k")      # whole disk: rescan already updated the size
+    fi
+}
+
+grow_partition() {
+    local k=$1 d n ss cur s e free=0 lim ext es ee inner outer m gain dev
+    d=$(part_disk "$k"); n=$(part_num "$k")
+    load_disk "$d"
+    ss=${DISK_SS[$d]}; cur=$(dev_bytes "$k"); dev=/dev/$d
+    if [[ -z ${PART_START[$d:$n]:-} ]]; then
+        NEWSIZE=$cur; CH_NOTE+="partition $n of $dev not found in its partition table; "; return
+    fi
+    s=${PART_START[$d:$n]}; e=$(( s + ${PART_SIZE[$d:$n]} ))
+
+    if [[ ${DISK_LABEL[$d]} == dos ]] && (( ${DISK_SECT[$d]} > 4294967296 )); then
+        CH_NOTE+="$dev uses an MBR (dos) partition table: space beyond 2 TiB cannot be used; "
+    fi
+
+    if part_is_logical "$d" "$n"; then
+        if ! ext=$(ext_num "$d"); then
+            NEWSIZE=$cur; CH_NOTE+="no extended partition found on $dev; "; return
+        fi
+        for m in ${DISK_PARTS[$d]}; do
+            if part_is_logical "$d" "$m" && (( ${PART_START[$d:$m]} > s )); then
+                NEWSIZE=$cur
+                CH_NOTE+="$(part_path "$d" "$n") is not the last logical partition on $dev; "
+                return
+            fi
+        done
+        es=${PART_START[$d:$ext]}; ee=$(( es + ${PART_SIZE[$d:$ext]} ))
+        inner=$(( ee - e )); lim=$(top_limit "$d" "$es"); outer=$(( lim - ee ))
+        (( outer < 0 )) && outer=0
+        free=$(( inner + outer ))
+        gain=$(( free * ss / MiB * MiB ))
+        if (( gain >= MiB )); then
+            needs_relocate "$d" && ch_add "Move the backup GPT header of $dev to the end of the disk" "sfdisk --relocate gpt-bak-std $dev"
+            if (( outer * ss >= MiB )); then
+                ch_add "Grow extended partition $ext on $dev" "echo ', +' | sfdisk --no-reread --no-tell-kernel -N $ext $dev"
+            fi
+            ch_add "Grow partition $n on $dev" "echo ', +' | sfdisk --no-reread --no-tell-kernel -N $n $dev"
+            ch_add "Tell the kernel about the new partition sizes on $dev" "partx -u $dev && { partx -a $dev 2>/dev/null; udevadm settle 2>/dev/null; true; }"
+            COVERED[$d:$n]=1; COVERED[$d:$ext]=1
+            CH_DISKS+="$d "
+        fi
+    else
+        lim=$(top_limit "$d" "$s"); free=$(( lim - e ))
+        (( free < 0 )) && free=0
+        gain=$(( free * ss / MiB * MiB ))
+        if (( gain >= MiB )); then
+            needs_relocate "$d" && ch_add "Move the backup GPT header of $dev to the end of the disk" "sfdisk --relocate gpt-bak-std $dev"
+            ch_add "Grow partition $n on $dev" "echo ', +' | sfdisk --no-reread --no-tell-kernel -N $n $dev"
+            ch_add "Tell the kernel about the new size of partition $n on $dev" "partx -u $dev && { partx -a $dev 2>/dev/null; udevadm settle 2>/dev/null; true; }"
+            COVERED[$d:$n]=1
+            CH_DISKS+="$d "
+        fi
+    fi
+    (( gain < MiB )) && gain=0
+    NEWSIZE=$(( cur + gain ))
+}
+
+grow_crypt() {
+    local k=$1 name cur parent pnew off new
+    local -a slaves=(/sys/block/"$k"/slaves/*)
+    name=$(cat "/sys/block/$k/dm/name"); cur=$(dev_bytes "$k")
+    if (( ${#slaves[@]} != 1 )) || [[ ! -e ${slaves[0]} ]]; then
+        NEWSIZE=$cur; CH_NOTE+="encrypted device $name has an unexpected layout; "; return
+    fi
+    parent=${slaves[0]##*/}
+    grow_layer "$parent"; pnew=$NEWSIZE
+    off=$(cryptsetup status "$name" 2>/dev/null | awk '$1 == "offset:" { print $2 }')
+    [[ $off =~ ^[0-9]+$ ]] || off=$(( ($(dev_bytes "$parent") - cur) / 512 ))
+    new=$(( pnew - off * 512 ))
+    if (( new - cur >= MiB )); then
+        ch_add "Grow encrypted device $name (LUKS may ask for the passphrase)" "cryptsetup resize $(q "$name")"
+        NEWSIZE=$new
+    else
+        NEWSIZE=$cur
+    fi
+}
+
+grow_md() {
+    local k=$1 level comp cur factor m mk mcur usable min=-1 delta
+    level=$(cat "/sys/block/$k/md/level" 2>/dev/null)
+    comp=$(( $(cat "/sys/block/$k/md/component_size" 2>/dev/null || echo 0) * 1024 ))
+    cur=$(dev_bytes "$k")
+    case $level in
+        raid1|raid4|raid5|raid6|raid10) ;;
+        *) NEWSIZE=$cur; CH_NOTE+="RAID level '$level' of /dev/$k cannot be grown in place; "; return ;;
+    esac
+    if (( comp <= 0 )); then NEWSIZE=$cur; CH_NOTE+="cannot read the component size of /dev/$k; "; return; fi
+    factor=$(( (cur + comp / 2) / comp ))
+    for m in /sys/block/"$k"/slaves/*; do
+        [[ -e $m ]] || continue
+        mk=${m##*/}; mcur=$(dev_bytes "$mk")
+        grow_layer "$mk"
+        usable=$(( NEWSIZE - (mcur - comp) ))
+        (( min < 0 || usable < min )) && min=$usable
+    done
+    delta=$(( (min - comp) / MiB * MiB ))
+    if (( delta >= MiB )); then
+        ch_add "Grow RAID array /dev/$k to use the larger members (a resync of the new area follows)" "mdadm --grow /dev/$k --size=max"
+        NEWSIZE=$(( cur + factor * delta ))
+    else
+        NEWSIZE=$cur
+        CH_NOTE+="not all members of /dev/$k can grow; "
+    fi
+}
+
+# --------------------------------------------------------------------------
+# discovery
+# --------------------------------------------------------------------------
+
+declare -a PV_LIST VG_LIST LV_LIST SRC_LIST NOTES
+declare -A PV_VG PV_SIZE PV_PESTART VG_SIZE VG_FREE VG_EXT VG_PVS
+declare -A LV_SIZE LV_ATTR LV_PATH LV_FS LV_MNT LV_USE LV_FSDEV LV_CRYPT
+declare -A SRC_KIND SRC_VG SRC_GAIN SRC_LABEL SRC_STEPS SRC_DISKS SRC_PVDEV SRC_DISK SRC_START SRC_SECTORS
+
+discover() {
+    PV_LIST=() VG_LIST=() LV_LIST=() SRC_LIST=() NOTES=()
+    declare -gA PV_VG=() PV_SIZE=() PV_PESTART=() VG_SIZE=() VG_FREE=() VG_EXT=() VG_PVS=()
+    declare -gA LV_SIZE=() LV_ATTR=() LV_PATH=() LV_FS=() LV_MNT=() LV_USE=() LV_FSDEV=() LV_CRYPT=()
+    declare -gA SRC_KIND=() SRC_VG=() SRC_GAIN=() SRC_LABEL=() SRC_STEPS=() SRC_DISKS=() SRC_PVDEV=()
+    declare -gA SRC_DISK=() SRC_START=() SRC_SECTORS=() COVERED=()
+    declare -gA DISK_LOADED=() DISK_LABEL=() DISK_SS=() DISK_SECT=() DISK_FIRSTLBA=() DISK_LASTLBA=() DISK_PARTS=()
+    declare -gA PART_START=() PART_SIZE=() PART_TYPE=()
+
+    discover_lvm
+    discover_lv_usage
+    discover_grow_sources
+    discover_free_sources
+}
+
+discover_lvm() {
+    local name vg size free pestart ext count path attr lv
+    while IFS='|' read -r name vg size _ _ pestart; do
+        [[ -n $name ]] || continue
+        PV_LIST+=("$name"); PV_VG[$name]=$vg; PV_SIZE[$name]=$size; PV_PESTART[$name]=$pestart
+    done < <(pvs --noheadings --units b --nosuffix --separator '|' \
+                 -o pv_name,vg_name,pv_size,pv_free,dev_size,pe_start 2>/dev/null | tr -d ' ')
+    while IFS='|' read -r vg size free ext count; do
+        [[ -n $vg ]] || continue
+        VG_LIST+=("$vg"); VG_SIZE[$vg]=$size; VG_FREE[$vg]=$free; VG_EXT[$vg]=$ext; VG_PVS[$vg]=$count
+    done < <(vgs --noheadings --units b --nosuffix --separator '|' \
+                 -o vg_name,vg_size,vg_free,vg_extent_size,pv_count 2>/dev/null | tr -d ' ')
+    while IFS='|' read -r vg lv size attr path; do
+        [[ -n $lv ]] || continue
+        # skip snapshots, cache/vdo/internal volumes; keep normal, origin, thin, raid, mirror
+        case ${attr:0:1} in s|S|C|d|D|v|e|i|I|l|p) continue ;; esac
+        LV_LIST+=("$vg/$lv"); LV_SIZE[$vg/$lv]=$size; LV_ATTR[$vg/$lv]=$attr; LV_PATH[$vg/$lv]=$path
+    done < <(lvs --noheadings --units b --nosuffix --separator '|' \
+                 -o vg_name,lv_name,lv_size,lv_attr,lv_path 2>/dev/null | tr -d ' ')
+}
+
+discover_lv_usage() {
+    local key path kn fsdev h hk fs mnt use
+    for key in "${LV_LIST[@]}"; do
+        LV_FS[$key]="" LV_MNT[$key]="" LV_USE[$key]="" LV_FSDEV[$key]="" LV_CRYPT[$key]=""
+        [[ ${LV_ATTR[$key]:0:1} == t ]] && { LV_FS[$key]="(thin pool)"; continue; }
+        [[ ${LV_ATTR[$key]:4:1} == a ]] || { LV_FS[$key]="(inactive)"; continue; }
+        path=${LV_PATH[$key]}
+        [[ -n $path && -b $path ]] || continue
+        kn=$(kname_of "$path"); fsdev=$path
+        for h in /sys/block/"$kn"/holders/*; do
+            [[ -e $h ]] || continue
+            hk=${h##*/}
+            if [[ $(cat "/sys/block/$hk/dm/uuid" 2>/dev/null) == CRYPT-* ]]; then
+                LV_CRYPT[$key]=$(cat "/sys/block/$hk/dm/name")
+                fsdev=/dev/mapper/${LV_CRYPT[$key]}
+            else
+                LV_FS[$key]="(used by $hk)"
+            fi
+        done
+        [[ -n ${LV_FS[$key]} ]] && continue
+        fs=$(blkid -o value -s TYPE "$fsdev" 2>/dev/null)
+        mnt=""; use=""
+        if [[ $fs == swap ]]; then
+            grep -q "^$(readlink -f "$fsdev") " /proc/swaps 2>/dev/null && mnt="[SWAP]"
+        elif [[ -n $fs ]]; then
+            mnt=$(findmnt -n -o TARGET --source "$fsdev" 2>/dev/null | head -n1)
+            [[ -n $mnt ]] && use=$(df -P "$mnt" 2>/dev/null | awk 'NR == 2 { print $5 }')
+        fi
+        LV_FS[$key]=$fs; LV_MNT[$key]=$mnt; LV_USE[$key]=$use; LV_FSDEV[$key]=$fsdev
+    done
+}
+
+discover_grow_sources() {
+    local pv k vg ext raw gain id steps
+    for pv in "${PV_LIST[@]}"; do
+        [[ -b $pv ]] || continue
+        k=$(kname_of "$pv")
+        [[ -e /sys/class/block/$k ]] || continue
+        CH_STEPS="" CH_NOTE="" CH_DISKS=""
+        grow_layer "$k"
+        vg=${PV_VG[$pv]}
+        ext=$((4 * MiB)); [[ -n $vg ]] && ext=${VG_EXT[$vg]:-$ext}
+        raw=$(( NEWSIZE - ${PV_PESTART[$pv]} ))
+        gain=$(( (raw - ${PV_SIZE[$pv]}) / ext * ext ))
+        (( gain < 0 )) && gain=0
+        steps=$CH_STEPS
+        (( gain > 0 )) && steps+="Grow physical volume $pv"$'\t'"pvresize $pv"$'\n'
+        [[ -n $CH_NOTE ]] && NOTES+=("$pv: ${CH_NOTE%; }")
+        id="pv:$pv"
+        if [[ -z $vg ]]; then
+            SRC_LIST+=("$id"); SRC_KIND[$id]=orphan; SRC_VG[$id]=""
+            SRC_GAIN[$id]=$(( ${PV_SIZE[$pv]} + gain )); SRC_PVDEV[$id]=$pv
+            SRC_LABEL[$id]="unused physical volume $pv -> add to a volume group"
+        elif (( gain > 0 )); then
+            SRC_LIST+=("$id"); SRC_KIND[$id]=grow; SRC_VG[$id]=$vg; SRC_GAIN[$id]=$gain
+            SRC_LABEL[$id]="grow $pv (volume group $vg)"
+        else
+            continue
+        fi
+        SRC_STEPS[$id]=$steps; SRC_DISKS[$id]=$CH_DISKS
+    done
+}
+
+discover_free_sources() {
+    local d n k ss align cursor prev idx=0 lim pdev start size line bytes used_primary
+    for d in $(list_disks); do
+        load_disk "$d"
+        [[ $(cat "/sys/block/$d/ro" 2>/dev/null) == 1 ]] && continue
+
+        if [[ ${DISK_LABEL[$d]} == none ]]; then
+            # whole disk without partition table: only if it carries nothing at all
+            has_holders "$d" || has_signature "$d" || is_mounted "$d" && continue
+            ls /sys/block/"$d"/"$d"* >/dev/null 2>&1 && continue
+            bytes=$(dev_bytes "$d")
+            (( bytes >= MIN_FREE )) || continue
+            local id="disk:/dev/$d"
+            SRC_LIST+=("$id"); SRC_KIND[$id]=newdisk; SRC_GAIN[$id]=$(( (bytes - MiB) / (4 * MiB) * (4 * MiB) ))
+            SRC_PVDEV[$id]=/dev/$d; SRC_DISKS[$id]=""
+            SRC_LABEL[$id]="empty disk /dev/$d -> new physical volume"
+            SRC_STEPS[$id]="Create physical volume on /dev/$d"$'\t'"pvcreate /dev/$d"$'\n'
+            continue
+        fi
+
+        ss=${DISK_SS[$d]}; align=$(( MiB / ss ))
+
+        # existing partitions that are completely unused
+        for n in ${DISK_PARTS[$d]}; do
+            part_is_extended "$d" "$n" && continue
+            [[ -n ${COVERED[$d:$n]:-} ]] && continue
+            pdev=$(part_path "$d" "$n"); k=${pdev#/dev/}
+            [[ -b $pdev ]] || continue
+            bytes=$(dev_bytes "$k")
+            (( bytes >= MIN_FREE )) || continue
+            has_holders "$k" || has_signature "$k" || is_mounted "$k" && continue
+            local pid="part:$pdev"
+            SRC_LIST+=("$pid"); SRC_KIND[$pid]=newdisk; SRC_GAIN[$pid]=$(( (bytes - MiB) / (4 * MiB) * (4 * MiB) ))
+            SRC_PVDEV[$pid]=$pdev; SRC_DISKS[$pid]=""
+            SRC_LABEL[$pid]="partition $pdev has no filesystem or signature -> new physical volume (make sure it is really unused!)"
+            SRC_STEPS[$pid]="Create physical volume on $pdev"$'\t'"pvcreate $pdev"$'\n'
+        done
+
+        # unallocated areas between / after top-level partitions
+        cursor=${DISK_FIRSTLBA[$d]}; (( cursor < align )) && cursor=$align
+        prev=""; idx=0
+        used_primary=0
+        while read -r start size n; do
+            [[ -n $start ]] || continue
+            (( n <= 4 )) && used_primary=$(( used_primary + 1 ))
+            (( start > cursor )) && free_gap "$d" "$cursor" "$start" "$prev"
+            (( start + size > cursor )) && cursor=$(( start + size ))
+            prev=$n
+        done < <(for n in ${DISK_PARTS[$d]}; do
+                     part_is_logical "$d" "$n" && continue
+                     echo "${PART_START[$d:$n]} ${PART_SIZE[$d:$n]} $n"
+                 done | sort -n)
+        lim=$(disk_end "$d")
+        (( lim > cursor )) && free_gap "$d" "$cursor" "$lim" "$prev"
+    done
+}
+
+free_gap() {   # free_gap DISK START END PREV_PART
+    local d=$1 s=$2 e=$3 prev=$4 align as ae ss n used=0 id
+    [[ -n $prev && -n ${COVERED[$d:$prev]:-} ]] && return 0
+    ss=${DISK_SS[$d]}; align=$(( MiB / ss ))
+    as=$(( (s + align - 1) / align * align )); ae=$(( e / align * align ))
+    (( (ae - as) * ss >= MIN_FREE )) || return 0
+    if [[ ${DISK_LABEL[$d]} == dos ]]; then
+        for n in ${DISK_PARTS[$d]}; do (( n <= 4 )) && used=$(( used + 1 )); done
+        if (( used >= 4 )); then
+            NOTES+=("/dev/$d: $(human $(( (ae - as) * ss ))) unallocated, but all 4 primary partition slots are in use")
+            return 0
+        fi
+    fi
+    idx=$(( idx + 1 ))
+    id="free:/dev/$d:$idx"
+    SRC_LIST+=("$id"); SRC_KIND[$id]=newpart; SRC_DISK[$id]=$d; SRC_START[$id]=$as; SRC_SECTORS[$id]=$(( ae - as ))
+    SRC_GAIN[$id]=$(( ((ae - as) * ss - MiB) / (4 * MiB) * (4 * MiB) ))
+    SRC_DISKS[$id]="$d "
+    SRC_LABEL[$id]="unallocated space on /dev/$d -> new partition + physical volume"
+    SRC_STEPS[$id]=""
+}
+
+# --------------------------------------------------------------------------
+# overview
+# --------------------------------------------------------------------------
+
+overview() {
+    local d id key vg note
+    echo "DISKS"
+    printf '  %-18s %9s  %-5s  %s\n' DEVICE SIZE TABLE "RESCAN"
+    for d in $(list_disks); do
+        load_disk "$d"
+        printf '  %-18s %9s  %-5s  %s\n' "/dev/$d" "$(human "$(dev_bytes "$d")")" "${DISK_LABEL[$d]}" "${RESCAN_INFO[$d]:-}"
+    done
+    echo
+    echo "SPACE THAT CAN BE ADDED"
+    if (( ${#SRC_LIST[@]} == 0 )); then
+        echo "  (nothing found - enlarge or add a disk first, then rescan)"
+    else
+        printf '  %-28s %9s  %s\n' ID SIZE WHAT
+        for id in "${SRC_LIST[@]}"; do
+            printf '  %-28s %9s  %s\n' "$id" "~$(human "${SRC_GAIN[$id]}")" "${SRC_LABEL[$id]}"
+        done
+    fi
+    echo
+    echo "VOLUME GROUPS"
+    if (( ${#VG_LIST[@]} == 0 )); then
+        echo "  (none)"
+    else
+        printf '  %-20s %9s %9s %4s\n' VG SIZE FREE PVS
+        for vg in "${VG_LIST[@]}"; do
+            printf '  %-20s %9s %9s %4s\n' "$vg" "$(human "${VG_SIZE[$vg]}")" "$(human "${VG_FREE[$vg]}")" "${VG_PVS[$vg]}"
+        done
+    fi
+    echo
+    echo "LOGICAL VOLUMES"
+    if (( ${#LV_LIST[@]} == 0 )); then
+        echo "  (none)"
+    else
+        printf '  %-28s %9s  %-12s %-20s %s\n' LV SIZE FS MOUNTPOINT USED
+        for key in "${LV_LIST[@]}"; do
+            printf '  %-28s %9s  %-12s %-20s %s\n' "$key" "$(human "${LV_SIZE[$key]}")" \
+                "${LV_FS[$key]:--}${LV_CRYPT[$key]:+ (luks)}" "${LV_MNT[$key]:--}" "${LV_USE[$key]:-}"
+        done
+    fi
+    if (( ${#NOTES[@]} > 0 )); then
+        echo
+        echo "NOTES"
+        for note in "${NOTES[@]}"; do echo "  - $note"; done
+    fi
+}
+
+# --------------------------------------------------------------------------
+# plans
+# --------------------------------------------------------------------------
+
+declare -a PLAN_DESC PLAN_CMD PLAN_NOTES PLAN_NEWPVS
+declare -A PLAN_RES
+PLAN_TITLE=""
+
+plan_reset() {
+    PLAN_DESC=() PLAN_CMD=() PLAN_NOTES=() PLAN_NEWPVS=()
+    declare -gA PLAN_RES=()
+    PLAN_TITLE=""
+}
+add_step() { PLAN_DESC+=("$1"); PLAN_CMD+=("$2"); }
+add_step_once() {
+    local c
+    for c in "${PLAN_CMD[@]}"; do [[ $c == "$2" ]] && return 0; done
+    add_step "$1" "$2"
+}
+add_note() { PLAN_NOTES+=("$1"); }
+
+plan_backup_disk() {
+    add_step_once "Back up the partition table of /dev/$1" \
+        "mkdir -p $(q "$BACKUP_DIR") && sfdisk -d /dev/$1 > $(q "$BACKUP_DIR/$1-$TS.sfdisk")"
+}
+
+plan_steps_from() {   # add "desc<TAB>cmd" lines
+    local desc cmd
+    while IFS=$'\t' read -r desc cmd; do
+        [[ -n $cmd ]] && add_step_once "$desc" "$cmd"
+    done <<<"$1"
+}
+
+next_part_num() {
+    local d=$1 n max=128
+    [[ ${DISK_LABEL[$d]} == dos ]] && max=4
+    for (( n = 1; n <= max; n++ )); do
+        [[ " ${DISK_PARTS[$d]} " == *" $n "* ]] && continue
+        [[ " ${PLAN_RES[$d]:-} " == *" $n "* ]] && continue
+        PLAN_RES[$d]+="$n "
+        echo "$n"; return 0
+    done
+    return 1
+}
+
+plan_newpart() {
+    local id=$1 d n pdev type
+    d=${SRC_DISK[$id]}
+    n=$(next_part_num "$d") || die "no free partition number on /dev/$d"
+    pdev=$(part_path "$d" "$n")
+    if [[ ${DISK_LABEL[$d]} == gpt ]]; then type=$GUID_LVM; else type=8e; fi
+    plan_backup_disk "$d"
+    needs_relocate "$d" && add_step_once "Move the backup GPT header of /dev/$d to the end of the disk" "sfdisk --relocate gpt-bak-std /dev/$d"
+    add_step "Create partition $n on /dev/$d ($(human $(( ${SRC_SECTORS[$id]} * ${DISK_SS[$d]} ))), type Linux LVM)" \
+        "echo 'start=${SRC_START[$id]}, size=${SRC_SECTORS[$id]}, type=$type' | sfdisk --no-reread --no-tell-kernel --append /dev/$d"
+    add_step "Make the kernel aware of $pdev" \
+        "partx -a -n $n /dev/$d 2>/dev/null || partx -u /dev/$d; udevadm settle 2>/dev/null; for i in \$(seq 50); do [ -b $pdev ] && break; sleep 0.2; done; [ -b $pdev ]"
+    add_step "Create physical volume on $pdev" "pvcreate -y $pdev"
+    PLAN_NEWPVS+=("$pdev")
+}
+
+# plan_sources VG IS_NEW_VG ID...
+plan_sources() {
+    local vg=$1 isnew=$2 id d
+    shift 2
+    for id in "$@"; do
+        for d in ${SRC_DISKS[$id]:-}; do plan_backup_disk "$d"; done
+    done
+    for id in "$@"; do
+        case ${SRC_KIND[$id]} in
+            grow)    plan_steps_from "${SRC_STEPS[$id]}" ;;
+            newdisk|orphan)
+                     plan_steps_from "${SRC_STEPS[$id]}"; PLAN_NEWPVS+=("${SRC_PVDEV[$id]}") ;;
+            newpart) plan_newpart "$id" ;;
+        esac
+        [[ ${SRC_STEPS[$id]:-} == *mdadm* ]] && add_note "The RAID array resyncs the new area in the background (see /proc/mdstat)."
+    done
+    if (( ${#PLAN_NEWPVS[@]} > 0 )); then
+        if (( isnew )); then
+            add_step "Create volume group $vg" "vgcreate $vg ${PLAN_NEWPVS[*]}"
+        else
+            add_step "Add ${PLAN_NEWPVS[*]} to volume group $vg" "vgextend $vg ${PLAN_NEWPVS[*]}"
+        fi
+    elif (( isnew )); then
+        die "a new volume group needs at least one source"
+    fi
+}
+
+# filesystem growth on DEV (fs type FS, mounted at MNT or "")
+plan_fs_grow() {
+    local dev=$1 fs=$2 mnt=$3 tmp=/run/dskxp/mnt ndev
+    case $fs in
+        ext2|ext3|ext4)
+            if [[ -n $mnt ]]; then
+                add_step "Grow the $fs filesystem on $dev (online)" "resize2fs $dev"
+            else
+                add_step "Check the $fs filesystem on $dev" "e2fsck -f -p $dev"
+                add_step "Grow the $fs filesystem on $dev" "resize2fs $dev"
+            fi ;;
+        xfs)
+            if [[ -n $mnt ]]; then
+                add_step "Grow the XFS filesystem mounted on $mnt" "xfs_growfs $(q "$mnt")"
+            else
+                add_step "Grow the XFS filesystem on $dev (temporary mount)" \
+                    "mkdir -p $tmp && mount -t xfs $dev $tmp && { xfs_growfs $tmp; rc=\$?; umount $tmp; exit \$rc; }"
+            fi ;;
+        btrfs)
+            ndev=$(btrfs filesystem show "$dev" 2>/dev/null | awk '/Total devices/ { print $3 }')
+            if [[ -n $ndev && $ndev != 1 ]]; then
+                add_note "$dev is part of a multi-device btrfs filesystem: grow it manually with 'btrfs filesystem resize <devid>:max <mountpoint>'."
+            elif [[ -n $mnt ]]; then
+                add_step "Grow the btrfs filesystem mounted on $mnt" "btrfs filesystem resize max $(q "$mnt")"
+            else
+                add_step "Grow the btrfs filesystem on $dev (temporary mount)" \
+                    "mkdir -p $tmp && mount -t btrfs $dev $tmp && { btrfs filesystem resize max $tmp; rc=\$?; umount $tmp; exit \$rc; }"
+            fi ;;
+        "")
+            add_note "No filesystem found on $dev: only the volume itself is extended." ;;
+        *)
+            add_note "Filesystem '$fs' on $dev is not grown automatically: grow it manually." ;;
+    esac
+}
+
+# plan_extend_lv VG/LV AMOUNT(bytes|all)
+plan_extend_lv() {
+    local key=$1 amount=$2 vg=${1%%/*} attr fs mnt fsdev crypt ext mib lvcmd uuid label swapactive=0
+    attr=${LV_ATTR[$key]}; fs=${LV_FS[$key]}; mnt=${LV_MNT[$key]}; fsdev=${LV_FSDEV[$key]}; crypt=${LV_CRYPT[$key]}
+    if [[ $amount == all ]]; then
+        lvcmd="lvextend -l +100%FREE $key"
+        PLAN_TITLE="Extend $key with all available space"
+    else
+        ext=${VG_EXT[$vg]:-$((4 * MiB))}
+        amount=$(( amount / ext * ext ))
+        mib=$(( amount / MiB ))
+        lvcmd="lvextend -L +${mib}m $key"
+        PLAN_TITLE="Extend $key by $(human "$amount")"
+    fi
+
+    if [[ $fs == swap ]]; then
+        [[ $mnt == "[SWAP]" ]] && swapactive=1
+        uuid=$(blkid -o value -s UUID "$fsdev" 2>/dev/null)
+        label=$(blkid -o value -s LABEL "$fsdev" 2>/dev/null)
+        if (( swapactive )); then
+            add_step "Turn off swap on $fsdev (needs enough free RAM)" "swapoff $fsdev"
+        fi
+        add_step "Extend logical volume $key" "$lvcmd"
+        [[ -n $crypt ]] && add_step "Grow encrypted device $crypt" "cryptsetup resize $(q "$crypt")"
+        add_step "Recreate the swap signature with the same UUID" \
+            "mkswap ${uuid:+-U $uuid }${label:+-L $(q "$label") }$fsdev"
+        (( swapactive )) && add_step "Turn swap back on" "swapon $fsdev"
+        return 0
+    fi
+
+    add_step "Extend logical volume $key" "$lvcmd"
+    case ${attr:0:1} in
+        t) add_note "$key is a thin pool: check the metadata usage afterwards with 'lvs -a $vg'."; return 0 ;;
+        V) add_note "$key is a thin volume: its pool is not grown by this step." ;;
+    esac
+    if [[ ${attr:4:1} != a ]]; then
+        add_note "$key is not active: the filesystem on it is not grown."
+        return 0
+    fi
+    [[ -n $crypt ]] && add_step "Grow encrypted device $crypt (LUKS may ask for the passphrase)" "cryptsetup resize $(q "$crypt")"
+    [[ $fs == \(* ]] && { add_note "$key: $fs - nothing to grow on top of it."; return 0; }
+    plan_fs_grow "${fsdev:-${LV_PATH[$key]}}" "$fs" "$mnt"
+}
+
+# plan_create_lv VG NAME AMOUNT FS MOUNTPOINT FSTAB(0/1)
+plan_create_lv() {
+    local vg=$1 name=$2 amount=$3 fs=$4 mp=$5 fstab=$6 dev mib ext lvc fmp pass opts
+    dev=/dev/$vg/$name
+    if [[ $amount == all ]]; then
+        lvc="lvcreate -y -l 100%FREE -n $name $vg"
+        PLAN_TITLE="Create $vg/$name with all available space"
+    else
+        ext=${VG_EXT[$vg]:-$((4 * MiB))}
+        amount=$(( amount / ext * ext )); mib=$(( amount / MiB ))
+        lvc="lvcreate -y -L ${mib}m -n $name $vg"
+        PLAN_TITLE="Create $vg/$name of $(human "$amount")"
+    fi
+    PLAN_TITLE+="${fs:+ ($fs${mp:+ on $mp})}"
+    add_step "Create logical volume $vg/$name" "$lvc"
+    case $fs in
+        ext4)  add_step "Create an ext4 filesystem"  "mkfs.ext4 $dev" ;;
+        xfs)   add_step "Create an XFS filesystem"   "mkfs.xfs $dev" ;;
+        btrfs) add_step "Create a btrfs filesystem"  "mkfs.btrfs $dev" ;;
+        swap)  add_step "Create swap space"          "mkswap $dev" ;;
+        none|"") return 0 ;;
+    esac
+    case $fs in ext4) pass=2 ;; *) pass=0 ;; esac
+    if [[ $fs == swap ]]; then
+        if (( fstab )); then
+            add_step "Back up /etc/fstab" "cp -a /etc/fstab /etc/fstab.dskxp-$TS"
+            add_step "Add the swap space to /etc/fstab" \
+                "printf 'UUID=%s none swap sw 0 0\n' \"\$(blkid -s UUID -o value $dev)\" >> /etc/fstab"
+        fi
+        add_step "Turn on the new swap space" "swapon $dev"
+        return 0
+    fi
+    [[ -n $mp ]] || return 0
+    add_step "Create mount point $mp" "mkdir -p $(q "$mp")"
+    if (( fstab )); then
+        fmp=${mp// /\\040}
+        opts=defaults
+        add_step "Back up /etc/fstab" "cp -a /etc/fstab /etc/fstab.dskxp-$TS"
+        add_step "Add $mp to /etc/fstab" \
+            "printf 'UUID=%s %s $fs $opts 0 $pass\n' \"\$(blkid -s UUID -o value $dev)\" $(q "$fmp") >> /etc/fstab"
+        add_step "Mount $mp" "systemctl daemon-reload 2>/dev/null; mount $(q "$mp")"
+    else
+        add_step "Mount $mp (not persistent: no /etc/fstab entry)" "mount $dev $(q "$mp")"
+    fi
+}
+
+plan_text() {
+    local i n=${#PLAN_CMD[@]} note
+    printf '%s\n\n' "$PLAN_TITLE"
+    for (( i = 0; i < n; i++ )); do
+        printf '%2d. %s\n      # %s\n' $(( i + 1 )) "${PLAN_DESC[i]}" "${PLAN_CMD[i]}"
+    done
+    if (( ${#PLAN_NOTES[@]} > 0 )); then
+        printf '\nNotes:\n'
+        for note in "${PLAN_NOTES[@]}"; do printf '  - %s\n' "$note"; done
+    fi
+    printf '\nAll commands and their output are logged to %s.\n' "$LOG_FILE"
+}
+
+execute_plan() {
+    local i n=${#PLAN_CMD[@]} rc txt
+    (( n > 0 )) || { ui_msg "Nothing to do" "There is nothing to change."; return 1; }
+    txt=$(plan_text)
+    if (( OPT_DRY_RUN )); then
+        ui_text "Plan (dry run - nothing is changed)" "$txt"
+        return 0
+    fi
+    if (( ! OPT_YES )); then
+        ui_text "Plan" "$txt"
+        ui_yesno "Apply changes?" "Run the ${n} steps shown on the previous screen?
+
+Make sure you have a backup or a VM snapshot." defaultno || { ui_msg "Cancelled" "Nothing was changed."; return 1; }
+    fi
+    [[ $UI == whiptail ]] && clear
+    log "PLAN: $PLAN_TITLE"
+    printf '%s\n' "$PLAN_TITLE"
+    for (( i = 0; i < n; i++ )); do
+        printf '\n==> [%d/%d] %s\n    # %s\n' $(( i + 1 )) "$n" "${PLAN_DESC[i]}" "${PLAN_CMD[i]}"
+        log "RUN [$(( i + 1 ))/$n]: ${PLAN_CMD[i]}"
+        if [[ -w $LOG_FILE || ( ! -e $LOG_FILE && -w $(dirname "$LOG_FILE") ) ]]; then
+            bash -c "set -o pipefail; ${PLAN_CMD[i]}" 2>&1 | tee -a "$LOG_FILE"
+            rc=${PIPESTATUS[0]}
+        else
+            bash -c "set -o pipefail; ${PLAN_CMD[i]}"
+            rc=$?
+        fi
+        if (( rc != 0 )); then
+            log "FAILED rc=$rc"
+            printf '\n!!! Step %d failed (exit code %d). The following steps were NOT run:\n' $(( i + 1 )) "$rc"
+            local j
+            for (( j = i + 1; j < n; j++ )); do printf '    # %s\n' "${PLAN_CMD[j]}"; done
+            printf 'Partition table backups: %s   Log: %s\n' "$BACKUP_DIR" "$LOG_FILE"
+            return 1
+        fi
+    done
+    log "DONE: $PLAN_TITLE"
+    printf '\nAll %d steps completed.\n' "$n"
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# user interface (whiptail or plain text)
+# --------------------------------------------------------------------------
+
+UI=text
+UI_REPLY=""
+UI_H=20 UI_W=76
+
+ui_init() {
+    if [[ $OPT_UI == text ]]; then
+        UI=text
+    elif [[ -t 0 && -t 1 ]] && command -v whiptail >/dev/null; then
+        UI=whiptail
+    else
+        UI=text
+    fi
+}
+
+ui_dims() {
+    local l c
+    l=$(tput lines 2>/dev/null || echo 24); c=$(tput cols 2>/dev/null || echo 80)
+    UI_H=$(( l - 2 )); UI_W=$(( c - 4 ))
+    (( UI_W > 130 )) && UI_W=130
+    (( UI_H < 15 )) && UI_H=15
+    (( UI_W < 60 )) && UI_W=60
+}
+
+ui_lines() { local t=$1; local n; n=$(printf '%s\n' "$t" | wc -l); echo "$n"; }
+
+ui_text() {   # long, scrollable text
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        whiptail --title "$1" --scrolltext --msgbox "$2" "$UI_H" "$UI_W"
+    else
+        printf '\n== %s ==\n%s\n' "$1" "$2"
+        [[ -t 0 ]] && read -r -p "Press Enter to continue... " _
+    fi
+    return 0
+}
+
+ui_msg() {
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        whiptail --title "$1" --msgbox "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
+    else
+        printf '\n== %s ==\n%s\n' "$1" "$2"
+    fi
+    return 0
+}
+
+ui_yesno() {   # ui_yesno TITLE TEXT [defaultno]
+    local a
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        whiptail --title "$1" ${3:+--defaultno} --yesno "$2" $(( $(ui_lines "$2") + 8 )) "$UI_W"
+        return
+    fi
+    printf '\n== %s ==\n%s\n' "$1" "$2"
+    while :; do
+        if [[ ${3:-} == defaultno ]]; then read -r -p "Continue? [y/N] " a || return 1; a=${a:-n}
+        else read -r -p "Continue? [Y/n] " a || return 1; a=${a:-y}; fi
+        case ${a,,} in y|yes) return 0 ;; n|no) return 1 ;; esac
+    done
+}
+
+ui_input() {   # ui_input TITLE TEXT DEFAULT
+    local a
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        UI_REPLY=$(whiptail --title "$1" --inputbox "$2" $(( $(ui_lines "$2") + 9 )) "$UI_W" "$3" 3>&1 1>&2 2>&3) || return 1
+        return 0
+    fi
+    printf '\n== %s ==\n%s\n' "$1" "$2"
+    read -r -p "> [${3}] " a || return 1
+    [[ $a == q ]] && return 1
+    UI_REPLY=${a:-$3}
+}
+
+ui_menu() {   # ui_menu TITLE TEXT TAG ITEM ...
+    local title=$1 text=$2 i a lh
+    shift 2
+    local -a tags=() items=() args=()
+    while (( $# >= 2 )); do tags+=("$1"); items+=("$2"); shift 2; done
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        lh=$(( UI_H - $(ui_lines "$text") - 8 )); (( lh > ${#tags[@]} )) && lh=${#tags[@]}; (( lh < 3 )) && lh=3
+        for i in "${!tags[@]}"; do args+=("${tags[i]}" "${items[i]}"); done
+        UI_REPLY=$(whiptail --title "$title" --notags --menu "$text" \
+            $(( lh + $(ui_lines "$text") + 8 )) "$UI_W" "$lh" "${args[@]}" 3>&1 1>&2 2>&3) || return 1
+        return 0
+    fi
+    printf '\n== %s ==\n%s\n\n' "$title" "$text"
+    for i in "${!tags[@]}"; do printf '  %2d) %s\n' $(( i + 1 )) "${items[i]}"; done
+    while :; do
+        read -r -p "Choose 1-${#tags[@]} (q = back): " a || return 1
+        [[ $a == q ]] && return 1
+        if [[ $a =~ ^[0-9]+$ ]] && (( a >= 1 && a <= ${#tags[@]} )); then UI_REPLY=${tags[a - 1]}; return 0; fi
+        echo "Invalid choice."
+    done
+}
+
+ui_checklist() {   # ui_checklist TITLE TEXT TAG ITEM ON|OFF ...  -> UI_REPLY newline separated
+    local title=$1 text=$2 i a lh
+    shift 2
+    local -a tags=() items=() states=() args=()
+    while (( $# >= 3 )); do tags+=("$1"); items+=("$2"); states+=("$3"); shift 3; done
+    if [[ $UI == whiptail ]]; then
+        ui_dims
+        lh=$(( UI_H - $(ui_lines "$text") - 8 )); (( lh > ${#tags[@]} )) && lh=${#tags[@]}; (( lh < 3 )) && lh=3
+        for i in "${!tags[@]}"; do args+=("${tags[i]}" "${items[i]}" "${states[i]}"); done
+        UI_REPLY=$(whiptail --title "$title" --notags --separate-output --checklist "$text" \
+            $(( lh + $(ui_lines "$text") + 8 )) "$UI_W" "$lh" "${args[@]}" 3>&1 1>&2 2>&3) || return 1
+        return 0
+    fi
+    printf '\n== %s ==\n%s\n' "$title" "$text"
+    while :; do
+        echo
+        for i in "${!tags[@]}"; do
+            if [[ ${states[i]} == ON ]]; then a="[x]"; else a="[ ]"; fi
+            printf '  %2d) %s %s\n' $(( i + 1 )) "$a" "${items[i]}"
+        done
+        read -r -p "Numbers to toggle (space separated), Enter = done, q = back: " a || return 1
+        [[ $a == q ]] && return 1
+        [[ -z $a ]] && break
+        for i in $a; do
+            if [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#tags[@]} )); then
+                if [[ ${states[i - 1]} == ON ]]; then states[i - 1]=OFF; else states[i - 1]=ON; fi
+            fi
+        done
+    done
+    UI_REPLY=""
+    for i in "${!tags[@]}"; do [[ ${states[i]} == ON ]] && UI_REPLY+="${tags[i]}"$'\n'; done
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# interactive flows
+# --------------------------------------------------------------------------
+
+SEL_SOURCES=()
+
+sources_for_vg() {   # ids usable for VG ("" = new VG)
+    local vg=$1 id
+    for id in "${SRC_LIST[@]}"; do
+        case ${SRC_KIND[$id]} in
+            grow) [[ -n $vg && ${SRC_VG[$id]} == "$vg" ]] && echo "$id" ;;
+            *) echo "$id" ;;
+        esac
+    done
+}
+
+sources_gain() { local id t=0; for id in "$@"; do t=$(( t + ${SRC_GAIN[$id]} )); done; echo "$t"; }
+
+# select_sources VG -> SEL_SOURCES; returns 1 on cancel
+select_sources() {
+    local vg=$1 id state text
+    local -a ids=() args=()
+    mapfile -t ids < <(sources_for_vg "$vg")
+    SEL_SOURCES=()
+    (( ${#ids[@]} > 0 )) || return 0
+    for id in "${ids[@]}"; do
+        state=OFF; [[ ${SRC_KIND[$id]} == grow ]] && state=ON
+        args+=("$id" "$(printf '%9s  %s' "~$(human "${SRC_GAIN[$id]}")" "${SRC_LABEL[$id]}")" "$state")
+    done
+    if [[ -n $vg ]]; then
+        text="Where should the extra space for volume group '$vg' come from?
+Free space already in the volume group: $(human "${VG_FREE[$vg]}") (always used)."
+    else
+        text="Which sources should the new volume group be built from?"
+    fi
+    ui_checklist "Select sources" "$text" "${args[@]}" || return 1
+    mapfile -t SEL_SOURCES < <(printf '%s' "$UI_REPLY" | sed '/^$/d')
+    return 0
+}
+
+ask_amount() {   # ask_amount WHAT AVAILABLE -> UI_REPLY = bytes|all
+    local what=$1 avail=$2 v
+    while :; do
+        ui_input "How much space?" "How much space should be added to $what?
+
+Available: ~$(human "$avail")
+Examples: 10G, 512M, 1.5T, 50%, all" "all" || return 1
+        if v=$(parse_size "$UI_REPLY" "$avail"); then
+            if [[ $v == all ]] || (( v > 0 && v <= avail )); then UI_REPLY=$v; return 0; fi
+            ui_msg "Too much" "$(human "$v") is more than the ~$(human "$avail") that is available."
+        else
+            ui_msg "Invalid size" "'$UI_REPLY' is not a valid size. Use for example 10G, 512M, 50% or all."
+        fi
+    done
+}
+
+flow_extend() {
+    local key vg avail gain amount
+    local -a args=()
+    for key in "${LV_LIST[@]}"; do
+        args+=("$key" "$(printf '%-26s %9s  %-10s %-18s %s' "$key" "$(human "${LV_SIZE[$key]}")" \
+            "${LV_FS[$key]:--}" "${LV_MNT[$key]:--}" "${LV_USE[$key]:+${LV_USE[$key]} used}")")
+    done
+    (( ${#args[@]} > 0 )) || { ui_msg "No logical volumes" "No logical volumes were found."; return; }
+    ui_menu "Extend a logical volume" "Which logical volume (mount point) needs more space?" "${args[@]}" || return
+    key=$UI_REPLY; vg=${key%%/*}
+    select_sources "$vg" || return
+    gain=$(sources_gain "${SEL_SOURCES[@]}")
+    avail=$(( ${VG_FREE[$vg]} + gain ))
+    if [[ ${LV_ATTR[$key]:0:1} != V ]] && (( avail < ${VG_EXT[$vg]} )); then
+        ui_msg "No space" "There is no free space for volume group $vg.
+
+Enlarge the disk in your hypervisor (or add a disk), then choose 'Rescan disks'."
+        return
+    fi
+    ask_amount "$key${LV_MNT[$key]:+ (${LV_MNT[$key]})}" "$avail" || return
+    amount=$UI_REPLY
+    plan_reset
+    plan_sources "$vg" 0 "${SEL_SOURCES[@]}"
+    plan_extend_lv "$key" "$amount"
+    execute_plan && after_run
+}
+
+choose_vg() {   # -> UI_REPLY = vg name, VG_IS_NEW
+    local vg
+    local -a args=()
+    for vg in "${VG_LIST[@]}"; do
+        args+=("$vg" "$(printf '%-20s size %9s   free %9s' "$vg" "$(human "${VG_SIZE[$vg]}")" "$(human "${VG_FREE[$vg]}")")")
+    done
+    args+=("__new__" "<create a new volume group>")
+    ui_menu "Volume group" "$1" "${args[@]}" || return 1
+    VG_IS_NEW=0
+    if [[ $UI_REPLY == __new__ ]]; then
+        while :; do
+            ui_input "New volume group" "Name of the new volume group:" "data-vg" || return 1
+            if ! valid_lvm_name "$UI_REPLY"; then ui_msg "Invalid name" "Use letters, digits and + _ . - only."; continue; fi
+            if [[ " ${VG_LIST[*]} " == *" $UI_REPLY "* ]]; then ui_msg "Exists" "Volume group $UI_REPLY already exists."; continue; fi
+            break
+        done
+        VG_IS_NEW=1
+    fi
+    return 0
+}
+
+valid_lvm_name() { [[ $1 =~ ^[A-Za-z0-9+_.][A-Za-z0-9+_.-]*$ && $1 != . && $1 != .. && ${#1} -le 127 ]]; }
+
+valid_mountpoint() {   # prints error, returns 1 if invalid
+    local mp=$1
+    [[ $mp == /* ]] || { echo "the mount point must be an absolute path"; return 1; }
+    [[ $mp == / ]] && { echo "/ cannot be used"; return 1; }
+    findmnt -n "$mp" >/dev/null 2>&1 && { echo "$mp is already a mount point"; return 1; }
+    awk -v m="${mp// /\\040}" '$1 !~ /^#/ && $2 == m { f = 1 } END { exit !f }' /etc/fstab 2>/dev/null &&
+        { echo "$mp is already listed in /etc/fstab"; return 1; }
+    if [[ -e $mp ]]; then
+        [[ -d $mp ]] || { echo "$mp exists and is not a directory"; return 1; }
+        [[ -z $(ls -A "$mp" 2>/dev/null) ]] || { echo "$mp is not empty (its files would be hidden)"; return 1; }
+    fi
+    return 0
+}
+
+available_filesystems() {
+    command -v mkfs.ext4  >/dev/null && echo ext4
+    command -v mkfs.xfs   >/dev/null && echo xfs
+    command -v mkfs.btrfs >/dev/null && echo btrfs
+    echo swap
+    echo none
+}
+
+flow_create() {
+    local vg isnew gain avail amount name fs mp="" fstab=1 err f
+    local -a args=()
+    choose_vg "In which volume group should the new logical volume be created?" || return
+    vg=$UI_REPLY; isnew=$VG_IS_NEW
+    if (( isnew )); then select_sources ""; else select_sources "$vg"; fi || return
+    if (( isnew && ${#SEL_SOURCES[@]} == 0 )); then ui_msg "No sources" "A new volume group needs at least one source."; return; fi
+    gain=$(sources_gain "${SEL_SOURCES[@]}")
+    avail=$(( ${VG_FREE[$vg]:-0} + gain ))
+    if (( avail < 4 * MiB )); then ui_msg "No space" "There is no free space for volume group $vg."; return; fi
+    while :; do
+        ui_input "Name" "Name of the new logical volume:" "data" || return
+        name=$UI_REPLY
+        valid_lvm_name "$name" || { ui_msg "Invalid name" "Use letters, digits and + _ . - only."; continue; }
+        [[ " ${LV_LIST[*]} " == *" $vg/$name "* ]] && { ui_msg "Exists" "$vg/$name already exists."; continue; }
+        break
+    done
+    ask_amount "the new volume $vg/$name" "$avail" || return
+    amount=$UI_REPLY
+    for f in $(available_filesystems); do
+        case $f in
+            ext4)  args+=(ext4  "ext4   - general purpose (can grow and shrink)") ;;
+            xfs)   args+=(xfs   "xfs    - large files / RHEL default (can only grow)") ;;
+            btrfs) args+=(btrfs "btrfs  - snapshots, compression") ;;
+            swap)  args+=(swap  "swap   - extra swap space") ;;
+            none)  args+=(none  "none   - leave the volume empty") ;;
+        esac
+    done
+    ui_menu "Filesystem" "Which filesystem should be created on $vg/$name?" "${args[@]}" || return
+    fs=$UI_REPLY
+    if [[ $fs != swap && $fs != none ]]; then
+        while :; do
+            ui_input "Mount point" "Where should $vg/$name be mounted? (empty = do not mount)" "/data" || return
+            mp=$UI_REPLY
+            [[ -z $mp ]] && break
+            mp=${mp%/}
+            err=$(valid_mountpoint "$mp") && break
+            ui_msg "Invalid mount point" "$err"
+        done
+    fi
+    if [[ -n $mp || $fs == swap ]]; then
+        ui_yesno "/etc/fstab" "Add ${mp:-the swap space} to /etc/fstab so it is used after a reboot?" || fstab=0
+    fi
+    plan_reset
+    plan_sources "$vg" "$isnew" "${SEL_SOURCES[@]}"
+    plan_create_lv "$vg" "$name" "$amount" "$fs" "$mp" "$fstab"
+    execute_plan && after_run
+}
+
+flow_add_to_vg() {
+    local vg isnew
+    choose_vg "To which volume group should the space be added?" || return
+    vg=$UI_REPLY; isnew=$VG_IS_NEW
+    if (( isnew )); then select_sources ""; else select_sources "$vg"; fi || return
+    (( ${#SEL_SOURCES[@]} > 0 )) || { ui_msg "Nothing selected" "No sources were selected."; return; }
+    plan_reset
+    plan_sources "$vg" "$isnew" "${SEL_SOURCES[@]}"
+    if (( isnew )); then PLAN_TITLE="Create volume group $vg"; else PLAN_TITLE="Add free space to volume group $vg"; fi
+    execute_plan && after_run
+}
+
+after_run() {
+    [[ -t 0 ]] && read -r -p "Press Enter to continue... " _
+    discover
+    ui_text "Storage after the changes" "$(overview)"
+}
+
+flow_rescan() {
+    rescan_disks
+    discover
+    ui_msg "Rescan" "${RESCAN_REPORT:-No size changes or new disks were detected.
+
+Tip: on Hyper-V and VMware the guest normally sees the new size right away;
+on some older systems a reboot is needed.}"
+}
+
+interactive() {
+    ui_init
+    discover
+    local head="Disks were rescanned. ${RESCAN_REPORT:+Changes:
+$RESCAN_REPORT}"
+    ui_text "dskxp $VERSION - storage overview" "$( (( OPT_RESCAN )) && printf '%s\n\n' "$head"; overview)"
+    while :; do
+        ui_menu "dskxp $VERSION" "What do you want to do?" \
+            extend   "Extend a logical volume (and its filesystem)" \
+            create   "Create a new logical volume" \
+            vg       "Only add free space to a volume group" \
+            overview "Show storage overview" \
+            rescan   "Rescan disks for size changes / new disks" \
+            quit     "Quit" || break
+        case $UI_REPLY in
+            extend)   flow_extend ;;
+            create)   flow_create ;;
+            vg)       flow_add_to_vg ;;
+            overview) ui_text "Storage overview" "$(overview)" ;;
+            rescan)   flow_rescan ;;
+            quit)     break ;;
+        esac
+    done
+    [[ $UI == whiptail ]] && clear
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# command line mode
+# --------------------------------------------------------------------------
+
+resolve_sources() {   # resolve_sources VG -> SEL_SOURCES (VG="" for a new VG)
+    local vg=$1 u id found
+    SEL_SOURCES=()
+    if (( ${#OPT_USE[@]} == 0 )); then OPT_USE=(auto); fi
+    for u in "${OPT_USE[@]}"; do
+        if [[ $u == auto ]]; then
+            for id in "${SRC_LIST[@]}"; do
+                [[ ${SRC_KIND[$id]} == grow && -n $vg && ${SRC_VG[$id]} == "$vg" ]] && SEL_SOURCES+=("$id")
+            done
+            continue
+        fi
+        found=""
+        for id in "$u" "pv:$u" "disk:$u" "part:$u" "free:$u:1"; do
+            [[ -n ${SRC_KIND[$id]:-} ]] && { found=$id; break; }
+        done
+        [[ -n $found ]] || die "unknown source '$u' (see 'dskxp --list')"
+        [[ ${SRC_KIND[$found]} == grow && ${SRC_VG[$found]} != "$vg" ]] && die "$found belongs to volume group ${SRC_VG[$found]}, not $vg"
+        [[ " ${SEL_SOURCES[*]} " == *" $found "* ]] || SEL_SOURCES+=("$found")
+    done
+}
+
+cli_extend() {
+    local key=$TARGET vg avail amount
+    [[ -n ${LV_SIZE[$key]:-} ]] || die "logical volume '$key' not found (use VG/LV, see 'dskxp --list')"
+    vg=${key%%/*}
+    resolve_sources "$vg"
+    avail=$(( ${VG_FREE[$vg]} + $(sources_gain "${SEL_SOURCES[@]}") ))
+    amount=$(parse_size "$OPT_SIZE" "$avail") || die "invalid size '$OPT_SIZE'"
+    if [[ ${LV_ATTR[$key]:0:1} != V ]]; then
+        if [[ $amount == all ]]; then
+            (( avail >= ${VG_EXT[$vg]} )) || die "no free space available for volume group $vg"
+        else
+            (( amount <= avail )) || die "$(human "$amount") requested, only ~$(human "$avail") available"
+        fi
+    fi
+    plan_reset
+    plan_sources "$vg" 0 "${SEL_SOURCES[@]}"
+    plan_extend_lv "$key" "$amount"
+    execute_plan
+}
+
+cli_create() {
+    local vg=${TARGET%%/*} name=${TARGET#*/} isnew=0 avail amount err
+    [[ $TARGET == */* ]] || die "use --create VG/NAME"
+    { valid_lvm_name "$vg" && valid_lvm_name "$name"; } || die "invalid name '$TARGET'"
+    [[ -n ${LV_SIZE[$TARGET]:-} ]] && die "$TARGET already exists"
+    [[ -n ${VG_SIZE[$vg]:-} ]] || isnew=1
+    if (( isnew )); then resolve_sources ""; (( ${#SEL_SOURCES[@]} )) || die "volume group $vg does not exist: give sources with --use"
+    else resolve_sources "$vg"; fi
+    avail=$(( ${VG_FREE[$vg]:-0} + $(sources_gain "${SEL_SOURCES[@]}") ))
+    amount=$(parse_size "$OPT_SIZE" "$avail") || die "invalid size '$OPT_SIZE'"
+    [[ $amount == all ]] || (( amount <= avail )) || die "$(human "$amount") requested, only ~$(human "$avail") available"
+    (( avail >= 4 * MiB )) || die "no free space available"
+    case $OPT_FS in ext4|xfs|btrfs|swap|none) ;; *) die "unsupported filesystem '$OPT_FS'" ;; esac
+    if [[ -n $OPT_MOUNT ]]; then
+        OPT_MOUNT=${OPT_MOUNT%/}
+        err=$(valid_mountpoint "$OPT_MOUNT") || die "$err"
+    fi
+    plan_reset
+    plan_sources "$vg" "$isnew" "${SEL_SOURCES[@]}"
+    plan_create_lv "$vg" "$name" "$amount" "$OPT_FS" "$OPT_MOUNT" "$OPT_FSTAB"
+    execute_plan
+}
+
+cli_add() {
+    local vg=$TARGET isnew=0
+    valid_lvm_name "$vg" || die "invalid volume group name '$vg'"
+    [[ -n ${VG_SIZE[$vg]:-} ]] || isnew=1
+    if (( isnew )); then resolve_sources ""; else resolve_sources "$vg"; fi
+    (( ${#SEL_SOURCES[@]} > 0 )) || die "nothing to add to $vg (see 'dskxp --list')"
+    plan_reset
+    plan_sources "$vg" "$isnew" "${SEL_SOURCES[@]}"
+    if (( isnew )); then PLAN_TITLE="Create volume group $vg"; else PLAN_TITLE="Add free space to volume group $vg"; fi
+    execute_plan
+}
+
+usage() {
+    cat <<EOF
+dskxp $VERSION - grow LVM storage after enlarging or adding a disk
+
+Usage:
+  dskxp                         interactive menu (whiptail, or plain text)
+  dskxp --list                  show disks, free space, volume groups and volumes
+  dskxp --extend VG/LV [options]
+  dskxp --create VG/LV [--fs ext4|xfs|btrfs|swap|none] [--mount DIR] [options]
+  dskxp --add VG [options]      only add space to a (new) volume group
+  dskxp --rescan                only rescan the disks and show what changed
+
+Options:
+  -s, --size SIZE     amount to add: 10G, 512M, 1.5T, 50%, all (default: all)
+  -u, --use SOURCE    where the space comes from; may be repeated. A source is an
+                      ID from --list (pv:/dev/sda3, disk:/dev/sdb, free:/dev/sda:1)
+                      or a plain device. Default: 'auto' = grow every PV of the
+                      volume group that can grow.
+      --mount DIR     mount point for --create
+      --no-fstab      do not add the new volume to /etc/fstab
+  -n, --dry-run       only show the plan, change nothing
+  -y, --yes           do not ask for confirmation
+      --no-rescan     do not rescan the disks at startup
+      --text          plain text prompts instead of whiptail
+  -h, --help          this help
+  -V, --version       show the version
+
+Examples:
+  sudo dskxp
+  sudo dskxp --extend ubuntu-vg/ubuntu-lv --dry-run
+  sudo dskxp --extend rl/root --size 20G --yes
+  sudo dskxp --create data-vg/backup --use /dev/sdb --fs xfs --mount /backup
+
+Log: $LOG_FILE   Partition table backups: $BACKUP_DIR
+EOF
+}
+
+parse_args() {
+    while (( $# )); do
+        case $1 in
+            -l|--list)     ACTION=list ;;
+            --extend)      ACTION=extend; TARGET=${2:?--extend needs VG/LV}; shift ;;
+            --create)      ACTION=create; TARGET=${2:?--create needs VG/LV}; shift ;;
+            --add)         ACTION=add;    TARGET=${2:?--add needs a VG}; shift ;;
+            --rescan)      ACTION=rescan ;;
+            -s|--size)     OPT_SIZE=${2:?--size needs a value}; shift ;;
+            -u|--use)      OPT_USE+=("${2:?--use needs a value}"); shift ;;
+            --fs)          OPT_FS=${2:?--fs needs a value}; shift ;;
+            --mount)       OPT_MOUNT=${2:?--mount needs a directory}; shift ;;
+            --no-fstab)    OPT_FSTAB=0 ;;
+            -n|--dry-run)  OPT_DRY_RUN=1 ;;
+            -y|--yes)      OPT_YES=1 ;;
+            --no-rescan)   OPT_RESCAN=0 ;;
+            --text)        OPT_UI=text ;;
+            -h|--help)     usage; exit 0 ;;
+            -V|--version)  echo "dskxp $VERSION"; exit 0 ;;
+            *)             die "unknown option '$1' (see --help)" ;;
+        esac
+        shift
+    done
+}
+
+check_requirements() {
+    local c missing=()
+    for c in sfdisk partx blkid findmnt awk pvs vgs lvs pvresize lvextend; do
+        command -v "$c" >/dev/null || missing+=("$c")
+    done
+    if (( ${#missing[@]} )); then
+        die "missing commands: ${missing[*]}
+  Debian/Ubuntu: apt install lvm2 util-linux fdisk
+  RHEL/Rocky/Alma: dnf install lvm2 util-linux"
+    fi
+}
+
+main() {
+    parse_args "$@"
+    (( EUID == 0 )) || die "must be run as root (try: sudo $0)"
+    check_requirements
+    if command -v flock >/dev/null; then
+        exec 9>"$LOCK_FILE" || die "cannot open $LOCK_FILE"
+        flock -n 9 || die "another dskxp is already running"
+    fi
+    (( OPT_RESCAN )) && rescan_disks
+    [[ -n $ACTION ]] && UI=text   # command line mode never uses whiptail
+    case $ACTION in
+        "")     interactive ;;
+        list)   discover; overview ;;
+        rescan) printf '%s\n' "${RESCAN_REPORT:-No size changes or new disks detected.}" ;;
+        extend) discover; cli_extend ;;
+        create) discover; cli_create ;;
+        add)    discover; cli_add ;;
+    esac
+}
+
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
