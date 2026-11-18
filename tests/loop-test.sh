@@ -204,6 +204,8 @@ check "-q hides the startup overview" test ! -s "$WORK/err"
 "$DSKXP" --list -v >/dev/null 2>"$WORK/err"
 check "-v shows the commands that are run" grep -q '\$ sfdisk -d /dev/' "$WORK/err"
 check "-v shows the LVM queries" grep -q '\$ pvs -o' "$WORK/err"
+check "--version shows the product line" test "$("$DSKXP" --version)" = "dskxp $(sed -n 's/^VERSION="\(.*\)"/\1/p' "$DSKXP") - A product of Rz//Sense"
+check "startup banner shows the product line" bash -c "'$DSKXP' --list --no-rescan 2>&1 >/dev/null | head -n1 | grep -q 'A product of Rz//Sense'"
 check "startup is written to the log" grep -q 'step 6/6: Looking for free space' "$DSKXP_LOG"
 
 # ---------------------------------------------------------------------------
