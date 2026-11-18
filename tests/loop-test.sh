@@ -48,6 +48,7 @@ wait_dev() {   # make the kernel (re)read the partitions of the parent loop devi
     for _i in $(seq 50); do [[ -b $1 ]] && return 0; sleep 0.2; done
     return 1
 }
+fs_bytes() { df -B1 --output=size "$1" | tail -n1 | tr -d ' '; }
 pv_bytes() { pvs --noheadings --units b --nosuffix -o pv_size "$1" 2>/dev/null | tr -d ' '; }
 vg_pvs()   { vgs --noheadings -o pv_count "$1" 2>/dev/null | tr -d ' '; }
 MB=1048576
@@ -143,6 +144,56 @@ check "list shows empty disk" grep -q "disk:$L" <<<"$out"
 check "dskxpt4 now has 2 PVs" test "$(vg_pvs dskxpt4)" = 2
 
 # ---------------------------------------------------------------------------
+echo "== Filesystems outside LVM"
+# xfs directly on a whole disk
+mkloop pxfs 400M
+mkfs.xfs -q "$L"; mkdir -p "$WORK/pxfs"; mount "$L" "$WORK/pxfs" && MOUNTS=("$WORK/pxfs" "${MOUNTS[@]}")
+before=$(fs_bytes "$WORK/pxfs")
+grow_img pxfs 800M
+out=$("$DSKXP" --list -q)
+check "xfs on a whole disk is listed as growable" grep -qE "$WORK/pxfs .*can grow" <<<"$out"
+"$DSKXP" --extend "$WORK/pxfs" --yes -q >"$WORK/run" 2>&1 || cat "$WORK/run"
+after=$(fs_bytes "$WORK/pxfs")
+check "xfs on a whole disk grew ($before -> $after)" test $(( after - before )) -gt $(( 350 * MB ))
+check "xfs on a whole disk: verification passed" grep -q "Result: all 1 checks passed" "$WORK/run"
+
+# ext4 on the last partition, mounted (online grow)
+mkloop pext 200M
+printf 'label: gpt\nsize=100MiB, type=linux\n' | sfdisk -q "$L"
+wait_dev "${L}p1"
+mkfs.ext4 -q "${L}p1"; mkdir -p "$WORK/pext"; mount "${L}p1" "$WORK/pext" && MOUNTS=("$WORK/pext" "${MOUNTS[@]}")
+before=$(fs_bytes "$WORK/pext")
+grow_img pext 500M
+"$DSKXP" --extend "$WORK/pext/" --yes -q >"$WORK/run" 2>&1
+if grep -q "Permission denied to resize" "$WORK/run"; then
+    echo "  skip online ext4 grow (not permitted in this container)"
+    check "partition grew although the filesystem could not" grep -q "OK \] partition ${L}p1 grew" "$WORK/run"
+    out=$("$DSKXP" --list -q --no-rescan)
+    check "a filesystem smaller than its partition is offered again" grep -qE "$WORK/pext .*can grow" <<<"$out"
+else
+    after=$(fs_bytes "$WORK/pext")
+    check "mounted ext4 on a partition grew ($before -> $after)" test $(( after - before )) -gt $(( 350 * MB ))
+    check "ext4 on a partition: verification passed" grep -q "Result: all 3 checks passed" "$WORK/run"
+fi
+check "--size is refused outside LVM" bash -c "! '$DSKXP' --extend '$WORK/pext' --size 1G -q --no-rescan >/dev/null 2>&1"
+
+# /boot-like: partition followed by an LVM partition -> must be refused with a reason
+mkloop pboot 300M
+printf 'label: gpt\nsize=60MiB, type=linux\nsize=100MiB, type=lvm\n' | sfdisk -q "$L"
+wait_dev "${L}p1" && wait_dev "${L}p2"
+mkfs.ext4 -q "${L}p1"; mkdir -p "$WORK/pboot"; mount "${L}p1" "$WORK/pboot" && MOUNTS=("$WORK/pboot" "${MOUNTS[@]}")
+pvcreate -q "${L}p2" && vgcreate -q dskxpt7 "${L}p2" >/dev/null && VGS+=(dskxpt7)
+grow_img pboot 600M
+before=$(cat "/sys/class/block/$(basename "$L")p1/size")
+out=$("$DSKXP" --list -q)
+check "/boot-like partition explains what is in the way" grep -q "${L}p1 is directly followed by ${L}p2 (LVM physical volume of volume group dskxpt7)" <<<"$out"
+if "$DSKXP" --extend "$WORK/pboot" --yes -q --no-rescan >"$WORK/run" 2>&1; then rc=0; else rc=1; fi
+check "/boot-like partition: grow refused" test "$rc" = 1
+check "/boot-like partition: unchanged" test "$(cat "/sys/class/block/$(basename "$L")p1/size")" = "$before"
+check "the space after it is still offered to LVM" grep -q "pv:${L}p2" <<<"$out"
+check "unknown mount point is rejected" bash -c "! '$DSKXP' --extend /nonexistent-mnt -q --no-rescan >/dev/null 2>&1"
+
+# ---------------------------------------------------------------------------
 echo "== Startup overview"
 "$DSKXP" --list --no-rescan >"$WORK/out" 2>"$WORK/err"
 check "startup steps are shown on stderr" grep -q '^\[6/6\] Looking for free space' "$WORK/err"
@@ -166,7 +217,6 @@ check "too large size is rejected" bash -c "! '$DSKXP' --create dskxpt4/big --si
 
 # ---------------------------------------------------------------------------
 echo "== Logical volumes and filesystems (needs device-mapper)"
-fs_bytes() { df -B1 --output=size "$1" | tail -n1 | tr -d ' '; }
 if ! dmsetup version >/dev/null 2>&1; then
     echo "  skip (no device-mapper in this kernel/container)"
 else
@@ -213,6 +263,9 @@ else
     check "new LV created and mounted" test "$(findmnt -n -o SOURCE "$WORK/new" 2>/dev/null)" = /dev/mapper/dskxpt6-new
     check "mount point in use is rejected" bash -c "! '$DSKXP' --create dskxpt6/x --size 8M --mount '$WORK/new' --dry-run --no-rescan >/dev/null 2>&1"
     check "new LV run verified (size, filesystem, mount)" grep -q "Result: all 3 checks passed" "$WORK/run"
+
+    out=$("$DSKXP" --extend "$WORK/data" --size 8M --dry-run -q --no-rescan 2>&1)
+    check "--extend accepts the mount point of an LV" grep -q "lvextend -L +8m dskxpt6/data" <<<"$out"
 
     # --check lists the volumes with a percentage
     out=$("$DSKXP" --check --no-rescan 2>&1)
